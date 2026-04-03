@@ -359,8 +359,11 @@ class WorkerPool:
         """Removes stale containers, disk files, and mount points from previous runs."""
         l.info("Cleaning up stale resources...")
         try:
-            # 1. Clean up stale containers
-            old_containers = await cls._docker.containers.list(filters={"label": ["managed-by=code-interpreter-gateway"]})
+            # 1. Clean up stale containers (include stopped/exited/dead containers after reboot)
+            old_containers = await cls._docker.containers.list(
+                all=True,
+                filters={"label": ["managed-by=code-interpreter-gateway"]},
+            )
             if old_containers:
                 l.warning(f"Found {len(old_containers)} stale worker containers. Cleaning up...")
                 cleanup_tasks = [c.delete(force=True) for c in old_containers]
@@ -616,8 +619,18 @@ class WorkerPool:
         return None
 
     @classmethod
+    async def _is_container_alive(cls, worker: Worker) -> bool:
+        """Checks if a worker's Docker container is still running."""
+        try:
+            container = cls._docker.containers.container(worker.container_id)
+            info = await container.show()
+            return info["State"]["Running"]
+        except DockerError:
+            return False
+
+    @classmethod
     async def recycle_timed_out_workers(cls) -> None:
-        """Background task to destroy timed out workers."""
+        """Background task to destroy timed-out and dead workers."""
         while not (cls._shutdown_event and cls._shutdown_event.is_set()):
             await asyncio.sleep(cls.RECYCLING_INTERVAL)
             try:
@@ -626,6 +639,9 @@ class WorkerPool:
                     for worker in list(cls._workers.values()):
                         if worker.is_timed_out(cls.WORKER_IDLE_TIMEOUT):
                             l.warning(f"Worker {worker.container_name} timed out.")
+                            workers_to_destroy.append(worker)
+                        elif not await cls._is_container_alive(worker):
+                            l.warning(f"Worker {worker.container_name} container is dead. Scheduling cleanup.")
                             workers_to_destroy.append(worker)
 
                     if not workers_to_destroy:
