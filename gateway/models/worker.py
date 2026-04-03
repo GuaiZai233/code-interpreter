@@ -92,7 +92,7 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
         """Gateway-side mount point (delegates to vdisk)."""
         return self.vdisk.host_mount_point
 
-    async def health_check(self, timeout: int = 30) -> bool:
+    async def health_check(self, timeout: int = 60) -> bool:
         """Performs health check on this worker."""
         start_time = time.time()
         while time.time() - start_time < timeout:
