@@ -10,7 +10,7 @@ from gateway.models.files import (
     FileExportRequest,
     FileExportResponse,
 )
-from gateway.utils.http_exceptions import raise_bad_request, raise_not_found
+from gateway.utils.http_exceptions import raise_bad_request, raise_not_found, raise_service_unavailable
 
 router = TaggedAPIRouter(prefix="/export", tag="File operations")
 
@@ -45,7 +45,11 @@ async def export_files(request: FileExportRequest, worker: WorkerDep) -> FileExp
             raise_not_found(f"File not found in sandbox: {e.message}")
         elif e.first_error == "ValueError":
             raise_bad_request(f"Invalid path: {e.message}")
+        elif e.first_error == "PermissionError":
+            raise_bad_request(f"Permission denied: {e.message}")
         else:
-            raise  # Let the global handler deal with unexpected errors
+            # Upload failures (S3 unreachable, timeout, etc.) → 503
+            l.error(f"Export failed with unexpected error: {e.first_error}: {e.message}")
+            raise_service_unavailable(f"File export failed: {e.message}")
     l.debug(f"Export files response: {results}")
     return FileExportResponse(success=True, results=results)
