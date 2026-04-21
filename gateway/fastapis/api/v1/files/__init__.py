@@ -42,7 +42,7 @@ async def upload_files(request: FileUploadRequest, worker: WorkerDep) -> FileUpl
     - 400 Bad Request: Invalid path or path traversal attempt
     - 502 Bad Gateway: Failed to download from presigned URL
     """
-    l.debug(f"Upload files request: {request}")
+    l.debug(f"Upload files request: {len(request.files)} file(s)")
     max_size_bytes = meta_config.MAX_FILE_SIZE_MB * 1024 * 1024
     try:
         results = await worker.upload_files(request.files, max_size_bytes)

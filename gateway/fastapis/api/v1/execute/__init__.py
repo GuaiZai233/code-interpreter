@@ -34,12 +34,16 @@ async def execute(request: ExecuteRequest, worker: WorkerDep) -> ExecuteResponse
     - 504 Gateway Timeout: Failed to connect to execution worker (auto-reset)
     - 500 Internal Server Error: Unexpected worker error
     """
-    l.debug(f"Execute request: {request}")
+    l.debug(f"Execute request: {len(request.code)} bytes")
     try:
         result = await worker.execute(request.code, meta_config.MAX_EXECUTION_TIMEOUT)
 
         match result.status_code:
             case 200:
+                if result.data is None:
+                    l.error(f"Worker {worker.container_name} returned 200 but unparseable body")
+                    await worker.release()
+                    raise_internal_error()
                 return ExecuteResponse(
                     result_text=result.data.result_text,
                     result_base64=result.data.result_base64,
@@ -47,7 +51,7 @@ async def execute(request: ExecuteRequest, worker: WorkerDep) -> ExecuteResponse
             case 400:
                 # Python execution error - return the error message as result_text
                 # Worker is still healthy, no need to release
-                l.debug(f"Worker {worker.container_name} returned Python error: {result.text}")
+                l.debug(f"Worker {worker.container_name} returned Python error ({len(result.text)} bytes)")
                 try:
                     error_data = orjson.loads(result.text)
                     error_message = error_data.get("detail", result.text)

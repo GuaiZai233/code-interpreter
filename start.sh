@@ -7,6 +7,8 @@ set -e
 
 # --- Default values (same as .env.example) ---
 AUTH_TOKEN=""
+BACKEND_BASE_URL=""
+SANDBOX_SERVICE_KEY=""
 MIN_IDLE_WORKERS=2
 MAX_TOTAL_WORKERS=8
 WORKER_CPU=1.5
@@ -20,6 +22,8 @@ IMAGE_TAG="latest"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --api-key) AUTH_TOKEN="$2"; shift 2;;
+    --backend-url) BACKEND_BASE_URL="$2"; shift 2;;
+    --sandbox-key) SANDBOX_SERVICE_KEY="$2"; shift 2;;
     --min-idle-workers) MIN_IDLE_WORKERS="$2"; shift 2;;
     --max-total-workers) MAX_TOTAL_WORKERS="$2"; shift 2;;
     --worker-cpu) WORKER_CPU="$2"; shift 2;;
@@ -32,6 +36,8 @@ while [ "$#" -gt 0 ]; do
       echo "Usage: $0 [OPTIONS]"
       echo "Options:"
       echo "  --api-key <string>          Custom API key (auto-generated if not set)"
+      echo "  --backend-url <url>         Backend API base URL (e.g. http://backend:8080)"
+      echo "  --sandbox-key <string>      Pre-shared key for backend service login"
       echo "  --min-idle-workers <num>    Minimum number of idle workers (default: 2)"
       echo "  --max-total-workers <num>   Maximum number of total workers (default: 8)"
       echo "  --worker-cpu <float>        CPU cores per worker (default: 1.5)"
@@ -56,6 +62,8 @@ cat > "$ENV_FILE" << EOF
 # To change configuration, stop services and re-run start.sh with new arguments,
 # or edit this file and run: docker-compose up -d
 AUTH_TOKEN=$AUTH_TOKEN
+BACKEND_BASE_URL=$BACKEND_BASE_URL
+SANDBOX_SERVICE_KEY=$SANDBOX_SERVICE_KEY
 MIN_IDLE_WORKERS=$MIN_IDLE_WORKERS
 MAX_TOTAL_WORKERS=$MAX_TOTAL_WORKERS
 WORKER_CPU=$WORKER_CPU

@@ -4,8 +4,9 @@ Authentication is handled by the Gateway. This service is not exposed publicly.
 """
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from loguru import logger as l
+from starlette.responses import JSONResponse
 
 from worker.fastapis import router
 from worker.models import JupyterKernel
@@ -27,9 +28,21 @@ app = FastAPI(title="Python Code Interpreter Worker", lifespan=lifespan)
 
 
 @app.exception_handler(Exception)
-async def handle_unexpected_exceptions(request: Request, exc: Exception):
+async def handle_unexpected_exceptions(request: Request, exc: Exception) -> JSONResponse:
+    """
+    Starlette exception handlers must return Response, not raise.
+
+    Inner handler uses raise_internal_error() for consistency; outer wrapper
+    catches HTTPException and converts to JSONResponse (same pattern as foxline backend).
+    """
     l.exception(f"Unhandled exception for request: {request.method} {request.url.path}")
-    raise_internal_error()
+    try:
+        raise_internal_error()
+    except HTTPException as http_exc:
+        return JSONResponse(
+            status_code=http_exc.status_code,
+            content={"detail": http_exc.detail},
+        )
 
 
 app.include_router(router)

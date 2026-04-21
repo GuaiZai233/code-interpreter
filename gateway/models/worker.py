@@ -168,7 +168,7 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
             timeout=aiohttp.ClientTimeout(total=timeout),
         ) as response:
             text = await response.text()
-            l.debug(f"Worker response: status={response.status}, body={text}")
+            l.debug(f"Worker response: status={response.status}, body_length={len(text)}")
 
             data = None
             if response.status == 200:
@@ -250,6 +250,8 @@ class WorkerPool:
     _is_initializing: ClassVar[bool] = True
     _is_replenishing: ClassVar[bool] = False
     _shutdown_event: ClassVar[asyncio.Event | None] = None
+    _background_tasks: ClassVar[set[asyncio.Task[Any]]] = set()
+    """Tracked background tasks (replenish, etc.) for graceful shutdown cancellation"""
     _volume_host_path: ClassVar[str] = ""
 
     def __new__(cls, *args, **kwargs) -> "WorkerPool":
@@ -270,8 +272,14 @@ class WorkerPool:
         coro: Coroutine[Any, Any, Any],
         name: str,
     ) -> asyncio.Task[Any]:
-        """Creates a background task with exception logging."""
+        """Creates a tracked background task with exception logging.
+
+        Tasks are tracked in _background_tasks for graceful shutdown cancellation.
+        Completed tasks are automatically removed from the set.
+        """
         task = asyncio.create_task(coro, name=name)
+        cls._background_tasks.add(task)
+        task.add_done_callback(cls._background_tasks.discard)
         task.add_done_callback(cls._task_done_callback)
         return task
 
@@ -339,10 +347,24 @@ class WorkerPool:
 
     @classmethod
     async def close(cls) -> None:
-        """Shuts down the WorkerPool gracefully."""
+        """Shuts down the WorkerPool gracefully.
+
+        1. Signal shutdown event (stops recycler loop and new replenish attempts)
+        2. Cancel + await all tracked background tasks (prevents orphan worker creation)
+        3. Snapshot + destroy all current workers
+        4. Close Docker client
+        """
         l.info("Shutting down WorkerPool...")
         if cls._shutdown_event:
             cls._shutdown_event.set()
+
+        # Cancel all in-flight background tasks (replenish, etc.) to prevent
+        # new workers being created after we snapshot the worker list.
+        for task in list(cls._background_tasks):
+            task.cancel()
+        if cls._background_tasks:
+            await asyncio.gather(*cls._background_tasks, return_exceptions=True)
+            cls._background_tasks.clear()
 
         async with cls._state_lock:
             all_workers = list(cls._workers.values())

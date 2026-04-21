@@ -139,8 +139,10 @@ class JupyterKernel(AioHttpClientSessionClassVarMixin):
                 f'{cls.JUPYTER_API_URL}/api/kernels/{kernel_id}',
                 timeout=cls._API_TIMEOUT,
             ) as response:
-                pass  # We don't need to check response for delete
-            l.info(f"Kernel {kernel_id} shut down successfully.")
+                if response.status < 300:
+                    l.info(f"Kernel {kernel_id} shut down successfully.")
+                else:
+                    l.warning(f"Kernel {kernel_id} DELETE returned {response.status}, may not be fully cleaned up")
         except aiohttp.ClientError as e:
             l.warning(f"Error shutting down kernel {kernel_id}: {e}")
         except Exception as e:
@@ -203,8 +205,7 @@ class JupyterKernel(AioHttpClientSessionClassVarMixin):
     async def execute_code(cls, code: str, is_initialization: bool = False) -> ExecutionResult:
         """Executes code in the Kernel and returns the result."""
         if not is_initialization:
-            code_preview = (code[:97] + '...' if len(code) > 100 else code).replace('\n', ' ')
-            l.info(f"Preparing to execute code: {code_preview.strip()}")
+            l.debug(f"Preparing to execute code: {len(code)} bytes")
             start_time = time.monotonic()
 
         escaped_code = json.dumps(code)[1:-1]
@@ -269,7 +270,7 @@ class JupyterKernel(AioHttpClientSessionClassVarMixin):
             try:
                 message_raw = await cls._ws_connection.recv()
                 msg = json.loads(message_raw)
-                l.debug(msg)
+                l.debug(f"Kernel msg: type={msg.get('msg_type')}, parent={msg.get('parent_header', {}).get('msg_id', '?')}")
 
                 if msg.get("parent_header", {}).get("msg_id") != msg_id:
                     continue
