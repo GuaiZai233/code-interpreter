@@ -5,9 +5,7 @@ This module provides the SandboxFileSystem class which encapsulates all
 sandbox file operations including path validation, upload, and export.
 """
 import asyncio
-import mimetypes
 import os as sync_os
-import stat as stat_module
 import uuid as uuid_mod
 from collections.abc import AsyncGenerator, Callable, Coroutine
 from pathlib import PurePosixPath
@@ -15,21 +13,13 @@ from typing import Any, ClassVar, TypeVar
 
 import aiofiles
 import aiohttp
-import anyio
-import filetype as ft
-import imagesize
-import orjson
 from aiofiles import os as async_os
-from anyio import to_thread
 from loguru import logger as l
-from PIL import Image
 from ssrf_protect.ssrf_protect import SSRFProtect, SSRFProtectException
 
 from gateway import meta_config
-from gateway.utils.aiohttp_client_session_mixin import AioHttpClientSessionClassVarMixin, _sanitize_url
-from gateway.utils.file_hash import StreamingHasher
+from gateway.utils.aiohttp_client_session_mixin import AioHttpClientSessionClassVarMixin
 
-from .backend_service import BackendService
 from .base import ModelBase
 from .exceptions import BatchFileOperationError
 from .field_types import Str256
@@ -178,12 +168,7 @@ class SandboxFileSystem(ModelBase, AioHttpClientSessionClassVarMixin):
 
             await async_os.rename(tmp_path, target_path)
         except (FileTooLargeError, FileDownloadError, aiohttp.ClientError, OSError) as e:
-            # Sanitize: aiohttp ClientResponseError.__str__() embeds the full URL
-            # (including presigned query params) in the error message
-            err_msg = str(e)
-            if hasattr(e, 'request_info'):
-                err_msg = f"HTTP {getattr(e, 'status', '?')}: {type(e).__name__}"
-            l.error(f"Upload failed: {err_msg}")
+            l.error(f"Upload failed: {type(e).__name__}: {e}")
             try:
                 await async_os.remove(tmp_path)
                 l.debug(f"Cleaned up temp file: {tmp_path}")
@@ -201,18 +186,27 @@ class SandboxFileSystem(ModelBase, AioHttpClientSessionClassVarMixin):
 
     async def export_file(self, file_item: FileExportItem) -> FileExportResultItem:
         """
-        Export a single file from the sandbox: hash, metadata, S3 upload, then promote.
+        Export a single file from the sandbox via Gateway dual-mount.
 
-        Flow per file:
-        1. Stat + stream-read for SHA-256 hash (64KB chunks)
-        2. Detect MIME type (mimetypes + filetype magic bytes)
-        3. Extract metadata: Pillow (image) / ffprobe (video/audio)
-        4. Upload to S3 via presigned POST (unchanged)
-        5. POST backend /files/{file_id}/promotions to promote PendingFile
+        Reads from the sandbox filesystem and uploads to the presigned URL
+        using streaming to avoid loading entire file into memory.
 
-        :raises FileNotFoundError: source file missing
-        :raises PermissionError: cannot read source file
-        :raises aiohttp.ClientError: S3 upload or backend promote failed
+        Supports two upload modes:
+        - **POST** (preferred): When ``upload_fields`` is provided, uses multipart
+          form POST with S3 presigned POST policy (enforces content-length-range at S3 level).
+        - **PUT** (legacy): When ``upload_fields`` is None, uses HTTP PUT with
+          Content-Length header (no S3-level size enforcement).
+
+        Args:
+            file_item: File export item with path, name, and upload URL.
+
+        Returns:
+            Export result with path, name, and size.
+
+        Raises:
+            FileNotFoundError: If source file doesn't exist.
+            PermissionError: If file cannot be read.
+            aiohttp.ClientError: If upload fails.
         """
         source_path = self.compute_path(file_item.path, file_item.name)
 
@@ -225,259 +219,31 @@ class SandboxFileSystem(ModelBase, AioHttpClientSessionClassVarMixin):
             l.error(f"Export failed: permission denied: {file_item.path}/{file_item.name}")
             raise
 
-        # Reject non-regular files: FIFO/device/socket would block open() indefinitely
-        # (user can mkfifo inside sandbox without privileges)
-        if not stat_module.S_ISREG(stat.st_mode):
-            raise ValueError(
-                f"File {file_item.name} is not a regular file (mode={oct(stat.st_mode)})"
-            )
-
-        file_size = stat.st_size
-        pre_mtime_ns = stat.st_mtime_ns
-
-        # Size gate: reject before expensive hash/metadata/upload if backend provided a limit
-        if file_item.max_size_bytes is not None and file_size > file_item.max_size_bytes:
-            raise ValueError(
-                f"File {file_item.name} ({file_size} bytes) exceeds export limit"
-                f" ({file_item.max_size_bytes} bytes)"
-            )
-
-        # 1. Compute SHA-256 hash + sniff first 4KB for magic bytes
-        content_hash, first_chunk = await self._compute_hash_and_sniff(source_path)
-
-        # 2. Detect MIME type
-        content_type = self._detect_mime(file_item.name, first_chunk)
-
-        # 3. Extract type-specific metadata
-        file_type, file_metadata = await self._extract_file_metadata(source_path, content_type)
-
-        # 4. Upload to S3 (presigned POST or PUT)
-        await self._upload_to_s3(file_item, source_path, file_size)
-
-        # TOCTOU best-effort check: detect accidental modification between hash and S3 upload.
-        # NOT a strong content-integrity proof: a malicious sandbox process can replace file
-        # content and restore mtime via utime(), making the hash/S3 content diverge undetected.
-        # Accepted trade-off: copy-to-temp is too expensive for the typical large-file case;
-        # a streaming hash-during-upload approach would be the ideal fix (future work).
-        # stat mtime_ns has nanosecond resolution — zero IO overhead, catches non-adversarial races.
-        post_stat = await async_os.stat(source_path)
-        if post_stat.st_mtime_ns != pre_mtime_ns or post_stat.st_size != file_size:
-            l.error(
-                f"File {file_item.name} was modified during export "
-                f"(mtime: {pre_mtime_ns} -> {post_stat.st_mtime_ns}, "
-                f"size: {file_size} -> {post_stat.st_size})"
-            )
-            raise ValueError(f"File {file_item.name} was modified during export, aborting promote")
-
-        # 5. Promote via backend domain model
-        await BackendService.promote_file(
-            file_item.file_id,
-            content_hash=content_hash,
-            content_type=content_type,
-            file_type=file_type,
-            file_size=file_size,
-            file_metadata=file_metadata,
-        )
-
-        l.debug(f"Exported file: {file_item.name} ({file_size} bytes, type={file_type})")
-        return FileExportResultItem(
-            path=file_item.path,
-            name=file_item.name,
-            size=file_size,
-        )
-
-    # ---- Export helper methods ----
-
-    HASH_CHUNK_SIZE: ClassVar[int] = 65536
-    """SHA-256 streaming chunk size (64KB)"""
-
-    MAGIC_SNIFF_SIZE: ClassVar[int] = 4096
-    """First N bytes captured for magic-byte MIME detection"""
-
-    FFPROBE_TIMEOUT_SECONDS: ClassVar[int] = 30
-    """ffprobe subprocess timeout"""
-
-    @classmethod
-    async def _compute_hash_and_sniff(cls, path: str) -> tuple[str, bytes]:
-        """
-        Stream-read file to compute SHA-256 hash and capture first bytes for MIME sniffing.
-
-        :return: (hex_digest, first_4kb_bytes)
-        """
-        hasher = StreamingHasher()
-        first_chunk = b''
-        async with aiofiles.open(path, 'rb') as f:
-            while chunk := await f.read(cls.HASH_CHUNK_SIZE):
-                hasher.update(chunk)
-                if not first_chunk:
-                    first_chunk = chunk[:cls.MAGIC_SNIFF_SIZE]
-        return hasher.hexdigest(), first_chunk
-
-    @staticmethod
-    def _detect_mime(name: str, first_chunk: bytes) -> str:
-        """
-        Detect MIME type: magic bytes authoritative, filename extension fallback.
-
-        Magic bytes reflect the actual file content (not user-controlled),
-        so they take priority. Filename extension is only used when magic-byte
-        detection returns nothing (e.g., plain text, CSV, unknown formats).
-
-        :return: MIME string (e.g. 'image/png'), defaults to 'application/octet-stream'
-        """
-        # Primary: magic bytes (reflects actual content, not user-controlled filename)
-        if first_chunk:
-            kind = ft.guess(first_chunk)
-            if kind is not None:
-                return kind.mime
-
-        # Fallback: filename extension (for formats without magic bytes, e.g., .csv, .txt)
-        mime, _ = mimetypes.guess_type(name)
-        return mime or 'application/octet-stream'
-
-    @classmethod
-    async def _extract_file_metadata(
-        cls, path: str, content_type: str,
-    ) -> tuple[str, dict[str, int | float | None] | None]:
-        """
-        Extract type-specific metadata matching backend FileMetadata schema.
-
-        :return: (file_type_str, metadata_dict_or_None)
-        """
-        if content_type.startswith('image/'):
-            return 'image', await cls._extract_image_metadata(path)
-        elif content_type.startswith('video/'):
-            return 'video', await cls._extract_video_metadata(path)
-        elif content_type.startswith('audio/'):
-            return 'audio', await cls._extract_audio_metadata(path)
-        return 'other', None
-
-    @staticmethod
-    async def _extract_image_metadata(path: str) -> dict[str, int | None]:
-        """
-        Extract image dimensions: imagesize primary, Pillow fallback.
-
-        Both run via ``to_thread`` to avoid blocking the event loop on corrupted files.
-        Follows backend ``ImageFile.extract_metadata_from_path`` pattern.
-        """
-        # Primary: imagesize (lightweight, seek-based, <0.1ms normal case)
-        try:
-            width, height = await to_thread.run_sync(imagesize.get, path)
-            if width != -1 and height != -1:
-                return {'width': width, 'height': height}
-            l.debug("imagesize could not parse dimensions, falling back to Pillow")
-        except Exception as e:
-            l.debug(f"imagesize failed, falling back to Pillow: {e}")
-
-        # Fallback: Pillow C extension (more robust, handles BMP etc.)
-        try:
-            def _pillow_get_size() -> tuple[int, int]:
-                with Image.open(path) as img:
-                    return img.size
-            width, height = await to_thread.run_sync(_pillow_get_size)
-            return {'width': width, 'height': height}
-        except Exception as e:
-            l.warning(f"Image metadata extraction failed: {e}")
-            return {'width': None, 'height': None}
-
-    @classmethod
-    async def _extract_video_metadata(cls, path: str) -> dict[str, int | float | None]:
-        """Extract video dimensions + duration via ffprobe."""
-        data = await cls._run_ffprobe(path)
-        if data is None:
-            return {'width': None, 'height': None, 'duration_seconds': None}
-
-        width: int | None = None
-        height: int | None = None
-        for stream in data.get('streams', []):
-            if stream.get('codec_type') == 'video':
-                width = stream.get('width')
-                height = stream.get('height')
-                break
-
-        return {
-            'width': width,
-            'height': height,
-            'duration_seconds': cls._parse_duration(data),
-        }
-
-    @classmethod
-    async def _extract_audio_metadata(cls, path: str) -> dict[str, float | None]:
-        """Extract audio duration via ffprobe."""
-        data = await cls._run_ffprobe(path)
-        if data is None:
-            return {'duration_seconds': None}
-        return {'duration_seconds': cls._parse_duration(data)}
-
-    @classmethod
-    async def _run_ffprobe(cls, source: str) -> dict[str, Any] | None:
-        """
-        Run ffprobe and return parsed JSON data.
-
-        Shared by video and audio metadata extraction.
-        Follows backend ``UserFile._run_ffprobe`` pattern.
-        """
-        try:
-            with anyio.fail_after(cls.FFPROBE_TIMEOUT_SECONDS):
-                result = await anyio.run_process(
-                    ['ffprobe', '-v', 'quiet', '-print_format', 'json',
-                     '-show_streams', '-show_format', source],
-                    check=False,
-                )
-            if result.returncode != 0:
-                l.warning(f"ffprobe returned non-zero for {source}: exit={result.returncode}")
-                return None
-            return orjson.loads(result.stdout)
-        except TimeoutError:
-            l.warning(f"ffprobe timed out ({cls.FFPROBE_TIMEOUT_SECONDS}s): {source}")
-            return None
-        except Exception as e:
-            l.warning(f"ffprobe failed: {e}")
-            return None
-
-    @staticmethod
-    def _parse_duration(ffprobe_data: dict[str, Any]) -> float | None:
-        """Extract duration from ffprobe data (format.duration preferred, stream fallback)."""
-        fmt = ffprobe_data.get('format', {})
-        duration_str = fmt.get('duration')
-        if duration_str is not None:
-            try:
-                return float(duration_str)
-            except (ValueError, TypeError):
-                pass
-
-        for stream in ffprobe_data.get('streams', []):
-            duration_str = stream.get('duration')
-            if duration_str is not None:
-                try:
-                    return float(duration_str)
-                except (ValueError, TypeError):
-                    continue
-        return None
-
-    async def _upload_to_s3(
-        self, file_item: FileExportItem, source_path: str, file_size: int,
-    ) -> None:
-        """Upload file to S3 via presigned POST or PUT."""
         try:
             if file_item.upload_fields is not None:
-                file_handle = open(source_path, 'rb')  # noqa: ASYNC230
+                # Presigned POST: multipart form with policy fields + file
+                # S3 POST 要求 'file' 字段放最后，策略字段在前
+                file_handle = open(source_path, 'rb')  # noqa: ASYNC230 — aiohttp FormData 内部分块读取
                 try:
                     data = aiohttp.FormData()
                     for field_name, field_value in file_item.upload_fields.items():
                         data.add_field(field_name, field_value)
                     data.add_field(
-                        'file', file_handle,
+                        'file',
+                        file_handle,
                         filename=file_item.name,
                         content_type='application/octet-stream',
                     )
                     async with self.http_session.post(
-                        str(file_item.upload_url), data=data,
+                        str(file_item.upload_url),
+                        data=data,
                         timeout=self.FILE_TRANSFER_TIMEOUT,
                     ) as response:
                         response.raise_for_status()
                 finally:
                     file_handle.close()
             else:
+                # Legacy PUT upload
                 async def file_reader() -> AsyncGenerator[bytes, None]:
                     async with aiofiles.open(source_path, 'rb') as f:
                         while chunk := await f.read(self.CHUNK_SIZE):
@@ -488,16 +254,21 @@ class SandboxFileSystem(ModelBase, AioHttpClientSessionClassVarMixin):
                     data=file_reader(),
                     headers={
                         'Content-Type': 'application/octet-stream',
-                        'Content-Length': str(file_size),
+                        'Content-Length': str(stat.st_size),
                     },
                     timeout=self.FILE_TRANSFER_TIMEOUT,
                 ) as response:
                     response.raise_for_status()
         except aiohttp.ClientError as e:
-            # Sanitize: ClientResponseError.__str__() embeds the full presigned URL
-            err_msg = f"HTTP {getattr(e, 'status', '?')}: {type(e).__name__}" if hasattr(e, 'request_info') else str(e)
-            l.error(f"S3 upload failed: {err_msg}")
+            l.error(f"Export failed (upload): {type(e).__name__}: {e}")
             raise
+
+        l.debug(f"Exported file ({stat.st_size} bytes)")
+        return FileExportResultItem(
+            path=file_item.path,
+            name=file_item.name,
+            size=stat.st_size,
+        )
 
     async def _run_with_semaphore(
         self,
