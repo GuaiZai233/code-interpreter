@@ -1,123 +1,55 @@
 """
-/files/export endpoint — NDJSON streaming response with per-file results.
-
-Each file's export result (promoted/failed) is emitted as a separate JSON line
-as soon as processing completes. Heartbeat lines are sent every 30 seconds
-during long-running file operations to keep proxies and client connections alive.
+/files/export endpoint for exporting files from sandbox.
 """
-import asyncio
-from collections.abc import AsyncGenerator
-
 from loguru import logger as l
-from starlette.responses import StreamingResponse
 
 from gateway.fastapis.deps import WorkerDep
 from gateway.fastapis.tagged_api_router import TaggedAPIRouter
+from gateway.models.exceptions import BatchFileOperationError
 from gateway.models.files import (
-    ExportFailedEvent,
-    ExportHeartbeatEvent,
-    ExportPromotedEvent,
-    FileExportItem,
     FileExportRequest,
+    FileExportResponse,
 )
-from gateway.models.sandbox_filesystem import SandboxFileSystem
-from gateway.models.worker import Worker
+from gateway.utils.http_exceptions import raise_bad_request, raise_not_found, raise_service_unavailable
 
 router = TaggedAPIRouter(prefix="/export", tag="File operations")
 
-HEARTBEAT_INTERVAL_SECONDS = 30
-"""Interval between heartbeat lines to keep proxies alive during slow file ops."""
 
-
-async def _export_ndjson_stream(
-    files: list[FileExportItem],
-    sandbox_fs: SandboxFileSystem,
-    worker: Worker,
-) -> AsyncGenerator[bytes, None]:
+@router.post("", response_model=FileExportResponse)
+async def export_files(request: FileExportRequest, worker: WorkerDep) -> FileExportResponse:
     """
-    Generate NDJSON lines: one per file result + periodic heartbeats.
+    Export files from the user's sandbox environment to presigned URLs.
 
-    Files are processed sequentially with shared semaphore for cross-request
-    concurrency control. Worker is touched per-file to prevent idle reaper
-    from reclaiming during long exports.
+    **Authentication**: Requires `user_uuid` query parameter to identify the session.
+
+    **Request Body**:
+    - `files`: List of file export items, each containing:
+      - `path`: Source directory path in sandbox (e.g., "/sandbox/output")
+      - `name`: Source filename to export
+      - `upload_url`: Presigned URL to upload the file to
+
+    **Response** (200 OK):
+    - `success`: Boolean indicating overall success
+    - `results`: List of export results with path, name, and size
+
+    **Error Responses**:
+    - 404 Not Found: File does not exist in sandbox
+    - 400 Bad Request: Invalid path or path traversal attempt
+    - 502 Bad Gateway: Failed to upload to presigned URL
     """
-    queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-
-    async def _heartbeat_loop() -> None:
-        try:
-            while True:
-                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
-                worker.touch()
-                event = ExportHeartbeatEvent()
-                await queue.put(event.model_dump_json().encode() + b'\n')
-        except asyncio.CancelledError:
-            pass
-
-    async def _process_files() -> None:
-        for file_item in files:
-            worker.touch()
-            try:
-                result = await sandbox_fs._run_with_semaphore(
-                    sandbox_fs.export_file, file_item,
-                )
-                event = ExportPromotedEvent(
-                    file_id=file_item.file_id,
-                    name=result.name,
-                    size=result.size,
-                )
-            except Exception as e:
-                l.error(f"Export failed for {file_item.name}: {type(e).__name__}: {e}")
-                event = ExportFailedEvent(
-                    file_id=file_item.file_id,
-                    error=f"{type(e).__name__}: {e}",
-                )
-            await queue.put(event.model_dump_json().encode() + b'\n')
-        await queue.put(None)
-
-    heartbeat_task = asyncio.create_task(_heartbeat_loop())
-    process_task = asyncio.create_task(_process_files())
-
+    l.debug(f"Export files request: {request}")
     try:
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            yield item
-    finally:
-        heartbeat_task.cancel()
-        if not process_task.done():
-            process_task.cancel()
-        for task in (heartbeat_task, process_task):
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-
-@router.post("")
-async def export_files(request: FileExportRequest, worker: WorkerDep) -> StreamingResponse:
-    """
-    Export files from sandbox — NDJSON streaming response.
-
-    Each file is processed independently: hash + metadata + S3 upload + backend promote.
-    Results are streamed as NDJSON lines as they complete. Heartbeat lines are sent
-    every 30s to keep proxy connections alive during slow uploads.
-
-    **Response format** (``application/x-ndjson``), each line is one of::
-
-        {"type":"heartbeat"}
-        {"type":"promoted","file_id":"...","name":"...","size":N}
-        {"type":"failed","file_id":"...","error":"..."}
-    """
-    l.debug(f"Export files request: {len(request.files)} file(s)")
-    worker.touch()
-    sandbox_fs = worker._get_sandbox_fs()
-    return StreamingResponse(
-        _export_ndjson_stream(request.files, sandbox_fs, worker),
-        status_code=202,
-        media_type='application/x-ndjson',
-        headers={
-            'X-Accel-Buffering': 'no',  # nginx: disable proxy buffering for streaming
-            'Cache-Control': 'no-cache',
-        },
-    )
+        results = await worker.export_files(request.files)
+    except BatchFileOperationError as e:
+        if e.first_error == "FileNotFoundError":
+            raise_not_found(f"File not found in sandbox: {e.message}")
+        elif e.first_error == "ValueError":
+            raise_bad_request(f"Invalid path: {e.message}")
+        elif e.first_error == "PermissionError":
+            raise_bad_request(f"Permission denied: {e.message}")
+        else:
+            # Upload failures (S3 unreachable, timeout, etc.) → 503
+            l.error(f"Export failed with unexpected error: {e.first_error}: {e.message}")
+            raise_service_unavailable(f"File export failed: {e.message}")
+    l.debug(f"Export files response: {results}")
+    return FileExportResponse(success=True, results=results)

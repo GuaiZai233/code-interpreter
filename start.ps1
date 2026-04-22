@@ -8,12 +8,6 @@ param(
 # 自定义 API Key (留空则自动生成)
     [string]$ApiKey = "",
 
-# 后端 API 地址 (如 http://backend:8080)
-    [string]$BackendBaseUrl = "",
-
-# 沙箱服务预共享密钥 (须与后端 SANDBOX_SERVICE_KEY 一致)
-    [string]$SandboxServiceKey = "",
-
 # 最小空闲工作实例数 (reduced from 15 to 10 due to higher per-worker resource requirements)
     [int]$MinIdleWorkers = 10,
 
@@ -57,12 +51,6 @@ $env:WORKER_INTERNET_ACCESS = if ($EnableInternet) { "true" } else { "false" }
 # 设置自定义 API Key（如果提供）
 if (-not [string]::IsNullOrWhiteSpace($ApiKey)) {
     $env:AUTH_TOKEN = $ApiKey
-}
-if (-not [string]::IsNullOrWhiteSpace($BackendBaseUrl)) {
-    $env:BACKEND_BASE_URL = $BackendBaseUrl
-}
-if (-not [string]::IsNullOrWhiteSpace($SandboxServiceKey)) {
-    $env:SANDBOX_SERVICE_KEY = $SandboxServiceKey
 }
 
 Write-Host "`n⚙️  Applying Configuration:" -ForegroundColor Cyan

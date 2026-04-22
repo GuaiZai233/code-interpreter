@@ -1,7 +1,7 @@
 FROM python:3.12.12-slim-bookworm
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends e2fsprogs util-linux git ffmpeg && \
+    apt-get install -y --no-install-recommends e2fsprogs util-linux git && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 

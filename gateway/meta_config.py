@@ -87,20 +87,6 @@ class MetaConfig(BaseSettings):
     MAX_FILE_SIZE_MB: int = 100
     """文件上传最大大小（MB）"""
 
-    # ----- Backend Service Auth -----
-    BACKEND_BASE_URL: str
-    """Backend API base URL for service login and file promotions"""
-
-    SANDBOX_SERVICE_KEY: str
-    """Pre-shared key matching backend's SANDBOX_SERVICE_KEY (POST /auth/service-jwt)"""
-
-    # ----- Logging -----
-    LOG_LEVEL: str = "DEBUG"
-    """Loguru log level (DEBUG/INFO/WARNING/ERROR)"""
-
-    LOG_FILE_PATH: str = "./temp/logs/gateway.log"
-    """Log file path (rotation: 10MB, retention: 30 days)"""
-
     # ----- Security -----
     SSRF_PROTECTION_ENABLED: bool = True
     """是否启用 SSRF 防护（内部网络访问场景可关闭）"""

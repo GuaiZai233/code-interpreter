@@ -5,7 +5,7 @@ Gateway uses dual-mount to directly access Worker's sandbox filesystem.
 """
 import tempfile
 from pathlib import PurePosixPath
-from typing import ClassVar, Literal
+from typing import ClassVar
 
 import aiohttp
 from loguru import logger as l
@@ -200,17 +200,11 @@ class FileUploadResponse(ModelBase):
 
 
 class FileExportItem(SandboxFileRefBase):
-    file_id: str
-    """Backend PendingFile UUID (used by gateway to call POST /promotions after S3 upload)"""
-
     upload_url: AnyHttpUrl
     """Presigned URL to upload to (POST URL when upload_fields is provided, PUT URL otherwise)"""
 
     upload_fields: dict[str, str] | None = None
     """POST form fields for presigned POST upload (includes policy, signature, etc.)"""
-
-    max_size_bytes: int | None = None
-    """Maximum file size in bytes (from backend presigned policy). Gateway rejects at stat time."""
 
 
 class FileExportRequest(ModelBase):
@@ -225,32 +219,3 @@ class FileExportResultItem(SandboxFileRefBase, FileResultBase):
 class FileExportResponse(ModelBase):
     success: bool = True
     results: list[FileExportResultItem]
-
-
-# ==================== Export NDJSON stream events ====================
-# Mirrored from backend code_interpreter.py — both sides must agree on schema.
-# Discriminated by `type` field.
-
-class ExportHeartbeatEvent(ModelBase):
-    """Heartbeat sent every 30s to keep proxies alive during slow file ops."""
-    type: Literal['heartbeat'] = 'heartbeat'
-
-
-class ExportPromotedEvent(ModelBase):
-    """File promoted successfully via backend /promotions."""
-    type: Literal['promoted'] = 'promoted'
-    file_id: str
-    """PendingFile UUID"""
-    name: str
-    """Filename"""
-    size: NonNegativeInt
-    """Actual file size in bytes"""
-
-
-class ExportFailedEvent(ModelBase):
-    """File export failed (S3 upload or /promotions error)."""
-    type: Literal['failed'] = 'failed'
-    file_id: str
-    """PendingFile UUID"""
-    error: str
-    """Failure reason"""
