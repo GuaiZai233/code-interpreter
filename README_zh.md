@@ -341,3 +341,6 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+## 许可证
+
+本项目基于 [MIT 许可证](LICENSE) 开源。

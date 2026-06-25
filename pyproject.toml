@@ -3,6 +3,8 @@ name = "code-interpreter"
 version = "1.1.0"
 description = "A stateful, secure, and high-performance Python sandbox"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
 
 [tool.ruff]
 line-length = 120
