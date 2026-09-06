@@ -50,6 +50,7 @@ services:
       - WORKER_RAM_MB=${WORKER_RAM_MB:-1536}
       - WORKER_MAX_DISK_SIZE_MB=${WORKER_MAX_DISK_SIZE_MB:-500}
       - WORKER_IMAGE_NAME=ghcr.io/foxerine/code-interpreter-worker:${IMAGE_TAG:-latest}
+      - SSRF_PROTECTION_ENABLED=${SSRF_PROTECTION_ENABLED:-true}
     depends_on:
       - worker # 确保 worker 镜像存在
 
