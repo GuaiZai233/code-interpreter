@@ -8,7 +8,6 @@ from fastapi import FastAPI, Request
 from loguru import logger as l
 
 from worker.fastapis import router
-from worker.models import JupyterKernel
 from worker.utils.aiohttp_client_session_mixin import AioHttpClientSessionClassVarMixin
 from worker.utils.http_exceptions import raise_internal_error
 
@@ -17,7 +16,6 @@ from worker.utils.http_exceptions import raise_internal_error
 async def lifespan(app: FastAPI):
     l.info("Worker is starting up...")
     await AioHttpClientSessionClassVarMixin.initialize_http_session()
-    await JupyterKernel.start()
     yield
     l.info("Worker is shutting down...")
     await AioHttpClientSessionClassVarMixin.close_http_session()
