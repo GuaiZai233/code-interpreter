@@ -639,12 +639,30 @@ async def test_phase_6(runner: TestRunner, token: str, test_uuid: str, worker_na
         # 6.17: Daemonization / setsid() process escape containment
         # Processes attempting to escape via setsid() are reaped by PR_SET_CHILD_SUBREAPER + proc tracking
         setsid_cmd = (
-            "python3 -c \""
-            "import os, time; "
-            "pid = os.fork(); "
-            "if pid == 0: "
-            "    os.setsid(); "
-            "    time.sleep(60)\" & echo daemon_spawned"
+            "python3 - << 'EOF'\n"
+            "import os, time, sys\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    os.setsid()\n"
+            "    with open('/sandbox/daemon.pid', 'w') as f:\n"
+            "        f.write(str(os.getpid()))\n"
+            "    time.sleep(60)\n"
+            "    sys.exit(0)\n"
+            "else:\n"
+            "    for _ in range(50):\n"
+            "        if os.path.exists('/sandbox/daemon.pid'):\n"
+            "            try:\n"
+            "                with open('/sandbox/daemon.pid') as f:\n"
+            "                    dpid = f.read().strip()\n"
+            "                if dpid:\n"
+            "                    print(f'DAEMON_PID:{dpid}', flush=True)\n"
+            "                    sys.exit(0)\n"
+            "            except Exception:\n"
+            "                pass\n"
+            "        time.sleep(0.05)\n"
+            "    print('DAEMON_PID:FAILED', flush=True)\n"
+            "    sys.exit(1)\n"
+            "EOF\n"
         )
         daemon_resp = await client.post(
             f"{GATEWAY_URL}/api/v1/shell/exec",
@@ -653,14 +671,33 @@ async def test_phase_6(runner: TestRunner, token: str, test_uuid: str, worker_na
             timeout=TIMEOUT,
         )
         daemon_data = daemon_resp.json() if daemon_resp.status_code == 200 else {}
+        daemon_stdout = daemon_data.get("stdout", "")
+        daemon_pid = None
+        for line in daemon_stdout.splitlines():
+            if line.startswith("DAEMON_PID:") and line.split(":", 1)[1].isdigit():
+                daemon_pid = line.split(":", 1)[1].strip()
+                break
+
         await asyncio.sleep(0.5)
-        ps_daemon = run_docker_exec(worker_name, ["pgrep", "-f", "time.sleep(60)"])
+        daemon_alive = False
+        if daemon_pid:
+            # Check if daemon process is still alive inside container
+            ps_daemon = run_docker_exec(worker_name, ["test", "-e", f"/proc/{daemon_pid}"])
+            daemon_alive = (ps_daemon.returncode == 0)
+        else:
+            ps_daemon = run_docker_exec(worker_name, ["pgrep", "-f", "time.sleep(60)"])
+            daemon_alive = (ps_daemon.returncode == 0)
+
         passed_daemon = (
             daemon_resp.status_code == 200
-            and daemon_data.get("stdout", "").strip() == "daemon_spawned"
-            and ps_daemon.returncode != 0
+            and daemon_pid is not None
+            and not daemon_alive
         )
-        runner.record("6.17", passed_daemon, "setsid() daemon escape contained and reaped via subreaper tracking")
+        runner.record(
+            "6.17",
+            passed_daemon,
+            f"setsid() daemon escape contained and reaped (spawned_pid={daemon_pid}, alive_after_exec={daemon_alive})",
+        )
 
         # 6.18: Shell profile persistence isolation (--noprofile --norc)
         # Attempting to persist arbitrary code via ~/.bash_profile or ~/.bashrc is ignored by fresh shell
@@ -683,6 +720,66 @@ async def test_phase_6(runner: TestRunner, token: str, test_uuid: str, worker_na
             and profile_data.get("stdout") == ""
         )
         runner.record("6.18", passed_profile_isolation, "Bash startup files (.bash_profile, .bashrc) ignored via --noprofile --norc")
+
+        # 6.19: Docker cgroup PidsLimit enforcement
+        # Fork bombs or excessive process spawning must be stopped at cgroup limit (default 256)
+        # without destabilizing the host or container, and all children must be cleanly reaped
+        pid_limit_cmd = (
+            "python3 - << 'EOF'\n"
+            "import os, sys, time\n"
+            "pids = []\n"
+            "hit_limit = False\n"
+            "try:\n"
+            "    for i in range(350):\n"
+            "        pid = os.fork()\n"
+            "        if pid == 0:\n"
+            "            time.sleep(10)\n"
+            "            sys.exit(0)\n"
+            "        pids.append(pid)\n"
+            "except (BlockingIOError, OSError):\n"
+            "    hit_limit = True\n"
+            "print(f'FORKED:{len(pids)},HIT_LIMIT:{hit_limit}', flush=True)\n"
+            "EOF\n"
+        )
+        pid_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": pid_limit_cmd},
+            timeout=TIMEOUT,
+        )
+        pid_data = pid_resp.json() if pid_resp.status_code == 200 else {}
+        pid_stdout = pid_data.get("stdout", "")
+        forked_count = 0
+        hit_limit = False
+        for part in pid_stdout.strip().split(","):
+            if part.startswith("FORKED:"):
+                try:
+                    forked_count = int(part.split(":", 1)[1])
+                except ValueError:
+                    pass
+            elif part.startswith("HIT_LIMIT:"):
+                hit_limit = (part.split(":", 1)[1].strip() == "True")
+
+        # Verify worker recovers cleanly and can execute subsequent commands
+        recover_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "echo worker_recovered"},
+            timeout=TIMEOUT,
+        )
+        recover_data = recover_resp.json() if recover_resp.status_code == 200 else {}
+        passed_pid_limit = (
+            pid_resp.status_code == 200
+            and hit_limit is True
+            and 0 < forked_count < 350
+            and recover_resp.status_code == 200
+            and recover_data.get("stdout", "").strip() == "worker_recovered"
+        )
+        runner.record(
+            "6.19",
+            passed_pid_limit,
+            f"PidsLimit enforced (forked={forked_count}, hit_limit={hit_limit}, worker_recovered={recover_data.get('stdout', '').strip() == 'worker_recovered'})",
+        )
 
 
 # =============================================================================

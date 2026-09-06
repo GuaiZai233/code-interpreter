@@ -19,7 +19,7 @@ from aiodocker.docker import Docker
 from aiodocker.exceptions import DockerError
 from aiofiles import os as async_os
 from loguru import logger as l
-from pydantic import Field, ValidationError
+from pydantic import Field, PrivateAttr, ValidationError
 from fastapi import HTTPException
 
 from gateway import meta_config
@@ -87,6 +87,7 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
     """Virtual disk resource (composition pattern)."""
     user_uuid: UUID | None = None
     last_active_timestamp: float = Field(default_factory=time.time)
+    _destroyed: bool = PrivateAttr(default=False)
 
     model_config = {'arbitrary_types_allowed': True}
 
@@ -124,7 +125,11 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
 
         Delegates disk cleanup to vdisk.destroy() (single source of truth).
         Order: unmount → delete container → detach loop → remove disk file.
+        Idempotent: safe against concurrent or multiple destroy invocations.
         """
+        if self._destroyed:
+            return
+        self._destroyed = True
         l.warning(f"Destroying worker: {self.container_name}")
 
         # 1. Destroy virtual disk (unmount + detach loop + remove file)
@@ -287,6 +292,7 @@ class WorkerPool:
     WORKER_MAX_DISK_SIZE_MB: ClassVar[int]
     WORKER_CPU: ClassVar[float]
     WORKER_RAM_MB: ClassVar[int]
+    WORKER_PIDS_LIMIT: ClassVar[int]
     # Internet access configuration
     WORKER_INTERNET_ACCESS: ClassVar[bool]
     INTERNET_NETWORK_NAME: ClassVar[str]
@@ -355,6 +361,7 @@ class WorkerPool:
         cls.WORKER_MAX_DISK_SIZE_MB = meta_config.WORKER_MAX_DISK_SIZE_MB
         cls.WORKER_CPU = meta_config.WORKER_CPU
         cls.WORKER_RAM_MB = meta_config.WORKER_RAM_MB
+        cls.WORKER_PIDS_LIMIT = meta_config.WORKER_PIDS_LIMIT
         # Internet access configuration
         cls.WORKER_INTERNET_ACCESS = meta_config.WORKER_INTERNET_ACCESS
         cls.INTERNET_NETWORK_NAME = meta_config.INTERNET_NETWORK_NAME
@@ -499,6 +506,7 @@ class WorkerPool:
                     'NetworkMode': network_name,
                     'Memory': cls.WORKER_RAM_MB * 1024 * 1024,
                     'NanoCpus': int(cls.WORKER_CPU * 1_000_000_000),
+                    'PidsLimit': cls.WORKER_PIDS_LIMIT,
                     # SECURITY DESIGN: Elevated capabilities required for sandbox functionality:
                     # - SYS_ADMIN: Required for mounting virtual disk inside container
                     # - NET_ADMIN/NET_RAW: Required for network namespace isolation
@@ -624,12 +632,22 @@ class WorkerPool:
 
     @classmethod
     async def release_worker(cls, worker: "Worker") -> None:
-        """Releases a specific worker instance."""
+        """
+        Releases a specific worker instance.
+        Idempotent: if worker is already released or being destroyed, ignores.
+        """
+        removed = False
         async with cls._state_lock:
-            if worker.user_uuid:
-                cls._user_to_worker_map.pop(worker.user_uuid, None)
-            cls._workers.pop(worker.container_id, None)
-            cls._idle_worker_ids.discard(worker.container_id)
+            if worker.container_id in cls._workers:
+                cls._workers.pop(worker.container_id, None)
+                removed = True
+                if worker.user_uuid:
+                    cls._user_to_worker_map.pop(worker.user_uuid, None)
+                cls._idle_worker_ids.discard(worker.container_id)
+
+        if not removed:
+            l.debug(f"Worker {worker.container_name} already removed from pool.")
+            return
 
         l.info(f"Releasing worker {worker.container_name}")
         await cls._destroy_worker(worker)

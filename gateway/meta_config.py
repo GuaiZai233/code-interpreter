@@ -73,6 +73,9 @@ class MetaConfig(BaseSettings):
     WORKER_MAX_DISK_SIZE_MB: int = 500
     """每个 Worker 的虚拟磁盘大小（MB）"""
 
+    WORKER_PIDS_LIMIT: int = 256
+    """每个 Worker 的最大 PID/进程数限制（防止 fork 炸弹耗尽宿主机 PID）"""
+
     # ----- Timeout Configuration -----
     WORKER_IDLE_TIMEOUT: int = 3600
     """Worker 空闲超时时间（秒），默认 1 小时"""
@@ -190,6 +193,7 @@ MAX_TOTAL_WORKERS: int = meta_config.MAX_TOTAL_WORKERS
 WORKER_CPU: float = meta_config.WORKER_CPU
 WORKER_RAM_MB: int = meta_config.WORKER_RAM_MB
 WORKER_MAX_DISK_SIZE_MB: int = meta_config.WORKER_MAX_DISK_SIZE_MB
+WORKER_PIDS_LIMIT: int = meta_config.WORKER_PIDS_LIMIT
 WORKER_IDLE_TIMEOUT: int = meta_config.WORKER_IDLE_TIMEOUT
 RECYCLING_INTERVAL: int = meta_config.RECYCLING_INTERVAL
 MAX_EXECUTION_TIMEOUT: float = meta_config.MAX_EXECUTION_TIMEOUT
