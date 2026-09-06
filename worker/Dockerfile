@@ -24,12 +24,13 @@ RUN apt-get update && \
         ca-certificates \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# --- Install uv and Python dependencies ---
+# --- Install Python dependencies using uv and remove build-only binaries ---
 COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /bin/
 
 COPY requirements.txt /tmp/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system -r /tmp/requirements.txt && rm /tmp/requirements.txt
+    uv pip install --system -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt /bin/uv /bin/uvx
 
 # --- Sandbox user ---
 RUN useradd --create-home -d /sandbox --shell /bin/bash sandbox && \

@@ -1,13 +1,13 @@
 """
 /reset endpoint.
 """
-from starlette.status import HTTP_204_NO_CONTENT
-
 from worker.fastapis.tagged_api_router import TaggedAPIRouter
+from worker.utils.http_exceptions import raise_not_implemented
 
 router = TaggedAPIRouter(prefix="/reset", tag="Reset kernel")
 
 
-@router.post("", status_code=HTTP_204_NO_CONTENT)
+@router.post("")
 async def reset_kernel() -> None:
-    return None
+    raise_not_implemented("Kernel reset is not supported in this minimal sandbox runtime.")
+
