@@ -2,6 +2,7 @@
 /shell/exec endpoint for Gateway service.
 Proxies arbitrary shell execution to the assigned Worker container.
 """
+import hashlib
 from loguru import logger as l
 
 from gateway.fastapis.deps import WorkerDep
@@ -26,7 +27,11 @@ async def shell_exec(request: ShellExecRequest, worker: WorkerDep) -> ShellExecR
     - Cwd is strictly confined within /sandbox.
     - Process tree is terminated upon timeout.
     """
-    l.debug(f"Gateway shell exec request for worker {worker.container_name}: command={request.command!r}")
+    cmd_hash = hashlib.sha256(request.command.encode("utf-8", errors="replace")).hexdigest()[:12]
+    l.debug(
+        f"Gateway shell exec request for worker {worker.container_name}: "
+        f"cmd_len={len(request.command)}, cmd_hash={cmd_hash}"
+    )
     response = await worker.shell_exec(request)
     l.debug(
         f"Gateway shell exec completed on worker {worker.container_name}: "

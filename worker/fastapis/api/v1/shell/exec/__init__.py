@@ -1,6 +1,7 @@
 """
 /shell/exec endpoint for Worker service.
 """
+import hashlib
 from loguru import logger as l
 
 from worker.fastapis.tagged_api_router import TaggedAPIRouter
@@ -15,7 +16,11 @@ async def shell_exec(request: ShellExecRequest) -> ShellExecResponse:
     """
     Executes a shell command inside the worker container.
     """
-    l.debug(f"Worker shell exec request: command={request.command!r}, cwd={request.cwd}, timeout={request.timeout}")
+    cmd_hash = hashlib.sha256(request.command.encode("utf-8", errors="replace")).hexdigest()[:12]
+    l.debug(
+        f"Worker shell exec request: cmd_len={len(request.command)}, "
+        f"cmd_hash={cmd_hash}, cwd={request.cwd}, timeout={request.timeout}"
+    )
     try:
         response = await default_shell_executor.execute(request)
         l.debug(

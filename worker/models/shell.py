@@ -5,11 +5,14 @@ Executes arbitrary shell commands inside the worker container with:
 - Non-root 'sandbox' user (inherited from Worker process)
 - Strict cwd confinement to /sandbox (rejects traversal and symlink escapes)
 - Minimal clean environment (no leaked secrets or host env)
+- Invocation via /bin/bash --noprofile --norc -c (no user startup file persistence)
+- PR_SET_CHILD_SUBREAPER + full process tree containment (cleans up background jobs & setsid)
 - Process-group isolation and termination on timeout (SIGTERM -> grace -> SIGKILL)
 - Bounded streaming output capture (capped memory with discard drain)
 - Serialized execution per Worker (asyncio.Lock)
 """
 import asyncio
+import ctypes
 import os
 import signal
 import time
@@ -20,6 +23,18 @@ from loguru import logger as l
 from pydantic import Field, field_validator
 
 from .base import ModelBase
+
+# Set PR_SET_CHILD_SUBREAPER so orphaned descendants reparent to this worker process
+PR_SET_CHILD_SUBREAPER = 36
+try:
+    if hasattr(ctypes, "CDLL"):
+        libc = ctypes.CDLL(None)
+        if hasattr(libc, "prctl"):
+            ret = libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+            if ret == 0:
+                l.debug("Worker process registered as child subreaper (PR_SET_CHILD_SUBREAPER)")
+except Exception as e:
+    l.warning(f"Failed to set PR_SET_CHILD_SUBREAPER: {e}")
 
 
 class ShellExecRequest(ModelBase):
@@ -175,31 +190,89 @@ class ShellExecutor:
         return resolved
 
     @staticmethod
-    async def _kill_process_group(pgid: int, grace_period: float = 0.5) -> None:
-        """Kills entire process group: SIGTERM -> grace period -> SIGKILL."""
+    def _get_sandbox_pids() -> set[int]:
+        """
+        Scans /proc for all process IDs belonging to the sandbox user (UID 1000).
+        """
+        pids = set()
+        try:
+            for entry in os.listdir("/proc"):
+                if entry.isdigit():
+                    pid = int(entry)
+                    try:
+                        with open(f"/proc/{pid}/status", "r") as f:
+                            for line in f:
+                                if line.startswith("Uid:"):
+                                    uids = line.split()[1:]
+                                    if any(u == "1000" for u in uids):
+                                        pids.add(pid)
+                                    break
+                    except (FileNotFoundError, ProcessLookupError, PermissionError):
+                        pass
+        except Exception as e:
+            l.debug(f"Error scanning /proc: {e}")
+        return pids
+
+    async def _cleanup_descendants(self, pgid: int, baseline_pids: set[int]) -> None:
+        """
+        Terminates and reaps all descendant processes spawned during command execution.
+        Guarantees that background jobs (&), orphan children, and setsid() processes
+        cannot outlive the execution request.
+        """
+        # 1. Kill the process group first
         if hasattr(os, "killpg"):
             try:
                 os.killpg(pgid, signal.SIGTERM)
             except ProcessLookupError:
-                return
+                pass
         else:
             try:
                 os.kill(pgid, signal.SIGTERM)
             except ProcessLookupError:
-                return
-
-        await asyncio.sleep(grace_period)
-
-        if hasattr(os, "killpg"):
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
                 pass
-        else:
-            try:
-                os.kill(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+
+        # 2. Check for any sandbox process that was not in baseline
+        current_pids = self._get_sandbox_pids()
+        orphan_pids = current_pids - baseline_pids
+
+        if orphan_pids:
+            for pid in orphan_pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+            # Brief grace period for cleanup
+            await asyncio.sleep(0.15)
+
+            # Force kill any still surviving processes
+            still_alive = self._get_sandbox_pids() - baseline_pids
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+            for pid in still_alive:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        # 3. Reap all reparented zombie children via waitpid loop (subreaper)
+        for _ in range(5):
+            reaped_any = False
+            while True:
+                try:
+                    rpid, _ = os.waitpid(-1, os.WNOHANG)
+                    if rpid <= 0:
+                        break
+                    reaped_any = True
+                except ChildProcessError:
+                    break
+            if not reaped_any:
+                break
+            await asyncio.sleep(0.05)
 
     async def execute(self, request: ShellExecRequest) -> ShellExecResponse:
         """
@@ -209,10 +282,16 @@ class ShellExecutor:
             resolved_cwd = self.validate_cwd(request.cwd)
             start_time = time.perf_counter()
 
-            # Launch /bin/bash -lc with clean minimal environment and new session
+            # Record baseline PIDs before launching command
+            baseline_pids = self._get_sandbox_pids()
+
+            # Launch /bin/bash --noprofile --norc -c with clean minimal environment and new session
+            # --noprofile --norc ensures user-writable /sandbox/.bash_profile or .bashrc are NEVER loaded
             process = await asyncio.create_subprocess_exec(
                 "/bin/bash",
-                "-lc",
+                "--noprofile",
+                "--norc",
+                "-c",
                 request.command,
                 cwd=str(resolved_cwd),
                 env=self.CLEAN_ENV,
@@ -243,8 +322,6 @@ class ShellExecutor:
                         timeout=drain_timeout,
                     )
                 except asyncio.TimeoutError:
-                    # A background child is holding the pipes open; clean up process group
-                    await self._kill_process_group(pgid)
                     stdout_task.cancel()
                     stderr_task.cancel()
                     await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
@@ -252,19 +329,21 @@ class ShellExecutor:
             except asyncio.TimeoutError:
                 timed_out = True
                 exit_code = None
-                # Kill the entire process group
-                await self._kill_process_group(pgid)
-
-                # Ensure process is reaped
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=1.0)
-                except Exception:
-                    pass
 
                 # Cancel and finish stream drainers
                 stdout_task.cancel()
                 stderr_task.cancel()
                 await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+
+            finally:
+                # Always clean up all descendant processes (orphans, background jobs &, setsid)
+                await self._cleanup_descendants(pgid, baseline_pids)
+
+                # Ensure main process is reaped
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=0.5)
+                except Exception:
+                    pass
 
             end_time = time.perf_counter()
             duration_ms = int((end_time - start_time) * 1000)

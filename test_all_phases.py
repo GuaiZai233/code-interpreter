@@ -29,7 +29,7 @@ import httpx
 # Configuration
 # =============================================================================
 
-GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:3874")
+GATEWAY_URL = os.environ.get("GATEWAY_URL", f"http://127.0.0.1:{os.environ.get('GATEWAY_PORT', '13874')}")
 TIMEOUT = 30.0
 
 
@@ -600,6 +600,89 @@ async def test_phase_6(runner: TestRunner, token: str, test_uuid: str, worker_na
             and net_data.get("exit_code") != 0
         )
         runner.record("6.14", passed_net, f"Outbound network traffic blocked in isolated mode (exit_code={net_data.get('exit_code')})")
+
+        # 6.15: Loopback / internal access to Worker control port 8000 is blocked
+        # Both iptables and verify_gateway_source middleware prevent commands in container
+        # from accessing http://127.0.0.1:8000/api/v1/shell/exec
+        loopback_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "curl -s -m 2 http://127.0.0.1:8000/api/v1/shell/exec || echo BLOCKED"},
+            timeout=TIMEOUT,
+        )
+        loopback_data = loopback_resp.json() if loopback_resp.status_code == 200 else {}
+        passed_loopback = (
+            loopback_resp.status_code == 200
+            and "BLOCKED" in loopback_data.get("stdout", "")
+            and "detail" not in loopback_data.get("stdout", "")
+        )
+        runner.record("6.15", passed_loopback, "Loopback access to worker port 8000 is blocked by iptables / gateway verification")
+
+        # 6.16: Background job (&) containment and orphan reaping
+        # Commands spawning detached background jobs (&) cannot leave surviving processes
+        bg_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "sleep 60 >/dev/null 2>&1 & echo launched"},
+            timeout=TIMEOUT,
+        )
+        bg_data = bg_resp.json() if bg_resp.status_code == 200 else {}
+        await asyncio.sleep(0.5)
+        ps_bg_sleep = run_docker_exec(worker_name, ["pgrep", "-f", "sleep 60"])
+        passed_bg_cleanup = (
+            bg_resp.status_code == 200
+            and bg_data.get("stdout", "").strip() == "launched"
+            and ps_bg_sleep.returncode != 0
+        )
+        runner.record("6.16", passed_bg_cleanup, "Background job (&) terminated upon command completion without lingering orphans")
+
+        # 6.17: Daemonization / setsid() process escape containment
+        # Processes attempting to escape via setsid() are reaped by PR_SET_CHILD_SUBREAPER + proc tracking
+        setsid_cmd = (
+            "python3 -c \""
+            "import os, time; "
+            "pid = os.fork(); "
+            "if pid == 0: "
+            "    os.setsid(); "
+            "    time.sleep(60)\" & echo daemon_spawned"
+        )
+        daemon_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": setsid_cmd},
+            timeout=TIMEOUT,
+        )
+        daemon_data = daemon_resp.json() if daemon_resp.status_code == 200 else {}
+        await asyncio.sleep(0.5)
+        ps_daemon = run_docker_exec(worker_name, ["pgrep", "-f", "time.sleep(60)"])
+        passed_daemon = (
+            daemon_resp.status_code == 200
+            and daemon_data.get("stdout", "").strip() == "daemon_spawned"
+            and ps_daemon.returncode != 0
+        )
+        runner.record("6.17", passed_daemon, "setsid() daemon escape contained and reaped via subreaper tracking")
+
+        # 6.18: Shell profile persistence isolation (--noprofile --norc)
+        # Attempting to persist arbitrary code via ~/.bash_profile or ~/.bashrc is ignored by fresh shell
+        setup_profile = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "echo 'export PERSISTED_VAR=compromised' > /sandbox/.bash_profile && echo 'export PERSISTED_VAR=compromised' > /sandbox/.bashrc"},
+            timeout=TIMEOUT,
+        )
+        check_profile = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "printf '%s' \"$PERSISTED_VAR\""},
+            timeout=TIMEOUT,
+        )
+        profile_data = check_profile.json() if check_profile.status_code == 200 else {}
+        passed_profile_isolation = (
+            setup_profile.status_code == 200
+            and check_profile.status_code == 200
+            and profile_data.get("stdout") == ""
+        )
+        runner.record("6.18", passed_profile_isolation, "Bash startup files (.bash_profile, .bashrc) ignored via --noprofile --norc")
 
 
 # =============================================================================

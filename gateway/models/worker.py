@@ -5,6 +5,7 @@ Worker composes VirtualDisk and SandboxFileSystem following the composition
 pattern. VirtualDisk.destroy() is the single source of truth for cleanup.
 """
 import asyncio
+import hashlib
 import os as sync_os
 import time
 import uuid as uuid_mod
@@ -219,7 +220,11 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
         Uses an envelope timeout so the worker container has sufficient time
         to reap its process group before Gateway drops the HTTP connection.
         """
-        l.debug(f"Executing shell command on worker {self.container_name}: {request.command!r}")
+        cmd_hash = hashlib.sha256(request.command.encode("utf-8", errors="replace")).hexdigest()[:12]
+        l.debug(
+            f"Executing shell command on worker {self.container_name}: "
+            f"cmd_len={len(request.command)}, cmd_hash={cmd_hash}"
+        )
         self.touch()
 
         envelope_timeout = aiohttp.ClientTimeout(total=request.timeout + 5.0)
@@ -246,9 +251,19 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
                 else:
                     text = await response.text()
                     l.error(f"Worker {self.container_name} shell exec failed: status={response.status}, body={text}")
+                    self.status = WorkerStatus.ERROR
+                    WorkerPool._create_background_task(
+                        WorkerPool.release_worker(self),
+                        f"release_failed_worker_{self.container_name}",
+                    )
                     raise_service_unavailable(f"Worker returned HTTP {response.status}")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             l.error(f"Failed to communicate with worker {self.container_name}: {e}")
+            self.status = WorkerStatus.ERROR
+            WorkerPool._create_background_task(
+                WorkerPool.release_worker(self),
+                f"release_unresponsive_worker_{self.container_name}",
+            )
             raise_gateway_timeout(f"Worker communication failed: {e}")
 
 

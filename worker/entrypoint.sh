@@ -19,11 +19,19 @@ echo "   -> Worker Internet Access: $INTERNET_ACCESS"
 
 # ============ INPUT 规则（入站流量）============
 iptables -P INPUT DROP
+# 核心安全边界：严格禁止非 Gateway 流量访问 Worker 控制端口 8000
+# 彻底阻断容器内部回环 (lo) 或自身 IP 访问控制端口，防止沙箱执行的命令直接调用 /shell/exec 等端点
+iptables -A INPUT -p tcp --dport 8000 ! -s "$GATEWAY_INTERNAL_IP" -j DROP
+iptables -A INPUT -i lo -p tcp --dport 8000 -j DROP
+
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 iptables -A INPUT -p tcp -m tcp --dport 8000 -s "$GATEWAY_INTERNAL_IP" -j ACCEPT
 
 # ============ OUTPUT 规则（出站流量）============
+# 核心安全边界：禁止容器内发往端口 8000 的所有出站连接（Worker 为服务端，不需要主动连接 8000）
+iptables -A OUTPUT -p tcp --dport 8000 -j DROP
+
 if [ "$INTERNET_ACCESS" = "true" ]; then
     echo "   -> Configuring OUTPUT rules for INTERNET-ENABLED mode..."
     iptables -P OUTPUT ACCEPT
