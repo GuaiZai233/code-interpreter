@@ -71,15 +71,9 @@ echo "   -> Virtual disk mounted to /sandbox."
 chown -R sandbox:sandbox /sandbox
 echo "   -> Changed ownership of /sandbox to 'sandbox' user."
 
-# --- Step 3.5: Create writable directories for runtime configs ---
-# These must be inside /sandbox to respect disk quota
-mkdir -p /sandbox/.config/matplotlib /sandbox/.jupyter
-chown -R sandbox:sandbox /sandbox/.config /sandbox/.jupyter
-echo "   -> Created runtime config directories in /sandbox."
-
 # --- Step 4: Drop Privileges and Start Services ---
 echo "🚀 Dropping privileges and starting Supervisor..."
 # Use exec to replace this script's process with the supervisord process.
 # Tini will act as the init system.
-# Supervisord will now start jupyter and fastapi as the 'sandbox' user.
+# Supervisord will now start fastapi as the 'sandbox' user.
 exec /usr/bin/tini -- /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
