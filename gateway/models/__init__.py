@@ -20,6 +20,7 @@ from .field_types import (
 )
 from .common import ErrorDetail
 from .execute import ExecuteRequest, ExecuteResponse
+from .shell import ShellExecRequest, ShellExecResponse
 from .files import (
     SandboxPath,
     SandboxFile,

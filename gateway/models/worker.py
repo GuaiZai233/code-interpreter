@@ -19,13 +19,20 @@ from aiodocker.exceptions import DockerError
 from aiofiles import os as async_os
 from loguru import logger as l
 from pydantic import Field, ValidationError
+from fastapi import HTTPException
 
 from gateway import meta_config
 from gateway.utils.aiohttp_client_session_mixin import AioHttpClientSessionClassVarMixin
+from gateway.utils.http_exceptions import (
+    raise_bad_request,
+    raise_gateway_timeout,
+    raise_service_unavailable,
+)
 
 from .base import ModelBase
 from .exceptions import WorkerPoolShuttingDownError, WorkerProvisionError
 from .field_types import Str128, Str256
+from .shell import ShellExecRequest, ShellExecResponse
 from .files import (
     FileExportItem,
     FileExportResultItem,
@@ -204,6 +211,45 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
         l.debug(f"Exporting {len(files)} file(s) from worker {self.container_name}")
         self.touch()
         return await self._get_sandbox_fs().export_files(files)
+
+    async def shell_exec(self, request: ShellExecRequest) -> ShellExecResponse:
+        """
+        Proxies shell execution request to worker container via HTTP.
+
+        Uses an envelope timeout so the worker container has sufficient time
+        to reap its process group before Gateway drops the HTTP connection.
+        """
+        l.debug(f"Executing shell command on worker {self.container_name}: {request.command!r}")
+        self.touch()
+
+        envelope_timeout = aiohttp.ClientTimeout(total=request.timeout + 5.0)
+        try:
+            async with self.http_session.post(
+                f"{self.internal_url}/api/v1/shell/exec",
+                json=request.model_dump(),
+                timeout=envelope_timeout,
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return ShellExecResponse(**data)
+                elif response.status in (400, 422):
+                    error_detail = await response.text()
+                    try:
+                        error_json = await response.json()
+                        error_detail = error_json.get("detail", error_detail)
+                    except Exception:
+                        pass
+                    if response.status == 400:
+                        raise_bad_request(error_detail)
+                    else:
+                        raise HTTPException(status_code=422, detail=error_detail)
+                else:
+                    text = await response.text()
+                    l.error(f"Worker {self.container_name} shell exec failed: status={response.status}, body={text}")
+                    raise_service_unavailable(f"Worker returned HTTP {response.status}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            l.error(f"Failed to communicate with worker {self.container_name}: {e}")
+            raise_gateway_timeout(f"Worker communication failed: {e}")
 
 
 class WorkerPool:
