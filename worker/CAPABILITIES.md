@@ -49,7 +49,20 @@ The minimal sandbox runtime strips away heavy document processing, browser autom
 - Secure file upload and download endpoints handle file transfer at the Gateway host level without passing untrusted file data through worker APIs.
 - Path traversal protections and SSRF guards enforced at Gateway boundary.
 
-### 4. Worker Lifecycle & Pool Management
+### 4. Isolated Shell Execution Engine (`POST /api/v1/shell/exec`)
+- **Execution Model**:
+  - Filesystem state persists only for the lifetime of a sandbox session.
+  - Each shell invocation runs in a fresh bash process.
+  - Shell variables, exported environment variables, aliases, and cwd do not persist across calls.
+- **Security Invariants**:
+  - **Non-root Execution**: Always runs as `sandbox` (UID 1000).
+  - **CWD Confinement**: Working directory is strictly resolved and verified to reside inside `/sandbox`. Rejects directory traversal attempts (`/etc`, `/sandbox/..`) and symlink escapes (e.g. symlink to `/etc`).
+  - **Process-Tree Termination**: Subprocesses are launched with `start_new_session=True`. On timeout, the entire process group (`SIGTERM` -> grace period -> `SIGKILL`) is cleanly reaped to eliminate orphan processes.
+  - **Bounded I/O Streams**: Captured `stdout` and `stderr` are capped at 1 MiB each. Excess data is drained and discarded to prevent memory bloat or OOM.
+  - **Clean Environment**: Executes with a strictly sanitized minimal environment (`HOME`, `USER`, `LOGNAME`, `PATH`, `LANG`, `LC_ALL`, `TERM`). Never leaks host or control-plane secrets.
+  - **Serialized Execution**: Invocations per Worker container are serialized with `asyncio.Lock` to avoid race conditions.
+
+### 5. Worker Lifecycle & Pool Management
 - Pre-warmed idle worker pool for instant allocation.
 - Fast `/health` check.
 - Complete teardown on session release (`/api/v1/release` 204), unmounting loop devices and destroying containers.

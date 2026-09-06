@@ -55,9 +55,52 @@ curl http://localhost:3874/api/v1/status \
   -H "X-Auth-Token: $(docker exec code-interpreter_gateway cat /gateway/auth_token.txt)"
 ```
 
-### 3. 执行测试套件
+### 3. Shell 执行接口 (Shell Execution API)
 
-测试套件完整验证了保留的 6 个阶段核心契约：
+在分配的隔离 Worker 容器中执行任意 shell 命令：
+
+```http
+POST /api/v1/shell/exec?user_uuid=<uuid>
+Content-Type: application/json
+X-Auth-Token: <token>
+
+{
+  "command": "git status && rg TODO .",
+  "cwd": "/sandbox",
+  "timeout": 30.0
+}
+```
+
+返回示例：
+
+```json
+{
+  "stdout": "...",
+  "stderr": "...",
+  "exit_code": 0,
+  "timed_out": false,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "duration_ms": 123
+}
+```
+
+#### 执行语义与安全保证：
+- **文件系统状态仅在当前 sandbox session 生命周期内持久化。**
+- **每次 shell exec 都启动新的 bash 进程。**
+- **shell 变量、export 环境变量、alias 和上一次 cd 状态不会跨调用保留。**
+- **非 root 身份执行**：始终以非 root 用户 `sandbox` (UID 1000) 执行。
+- **严格 cwd 限制**：工作目录必须严格解析在 `/sandbox` 之下。路径穿越（如 `/etc`、`/sandbox/..`）和逃逸软链接（如指向 `/etc` 的 symlink）会被统一拦截并返回 HTTP 400。
+- **进程组超时终止**：每个命令以新的进程组会话领导者身份启动（`start_new_session=True`）。发生超时后，完整终止该进程组（`SIGTERM` -> 优雅期 -> `SIGKILL`），杜绝后台残留孤儿进程。
+- **流式输出限流**：`stdout` 和 `stderr` 分别限制最大捕获 1 MiB，超额部分自动丢弃排空，防止产生 OOM。
+- **极简安全环境变量**：仅注入受限的环境变量（`HOME`, `USER`, `LOGNAME`, `PATH`, `LANG`, `LC_ALL`, `TERM`），绝不向命令泄露宿主机或控制面敏感配置。
+- **零宿主机执行**：Gateway 严禁在宿主机直接执行用户命令，也严禁通过 `docker exec` 执行用户命令。所有命令仅在分配的 Worker 容器内部运行。
+
+---
+
+### 4. 执行测试套件
+
+测试套件完整验证了 7 个阶段的核心契约：
 
 ```bash
 python test_all_phases.py
@@ -69,7 +112,8 @@ python test_all_phases.py
 - **Phase 3**: Worker 调度、虚拟磁盘 ext4 挂载 (`/sandbox`) 与非 root `sandbox` 用户权限
 - **Phase 4**: iptables 双模防火墙隔离策略校验
 - **Phase 5**: 双挂载架构文件流操作（文件落地校验、路径穿越拦截及 404 响应）
-- **Phase 6**: 会话主动释放、Worker 容器与回环虚拟磁盘销毁、空闲池自动补齐
+- **Phase 6**: Shell 执行接口全量契约测试（基础执行、stderr 独立捕获、非零退出码、工作目录隔离、路径穿越与软链接逃逸拦截、文件系统生命周期持久化、shell 环境变量不持久、进程树超时全量清理、流式输出截断防爆内存、非 root UID 1000 校验、只读保护与网络隔离）
+- **Phase 7**: 会话主动释放、Worker 容器与回环虚拟磁盘销毁、空闲池自动补齐与释放清理销毁校验
 
 ---
 

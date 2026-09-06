@@ -55,9 +55,52 @@ curl http://localhost:3874/api/v1/status \
   -H "X-Auth-Token: $(docker exec code-interpreter_gateway cat /gateway/auth_token.txt)"
 ```
 
-### 3. Run the Test Suite
+### 3. Shell Execution API
 
-The test suite validates the 6 retained phases of the minimal sandbox runtime:
+Execute arbitrary shell commands in an isolated Worker container:
+
+```http
+POST /api/v1/shell/exec?user_uuid=<uuid>
+Content-Type: application/json
+X-Auth-Token: <token>
+
+{
+  "command": "git status && rg TODO .",
+  "cwd": "/sandbox",
+  "timeout": 30.0
+}
+```
+
+Response:
+
+```json
+{
+  "stdout": "...",
+  "stderr": "...",
+  "exit_code": 0,
+  "timed_out": false,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "duration_ms": 123
+}
+```
+
+#### Execution & Isolation Guarantees:
+- **Filesystem state persists only for the lifetime of a sandbox session.**
+- **Each shell invocation runs in a fresh bash process.**
+- **Shell variables, exported environment variables, aliases, and cwd do not persist across calls.**
+- **Non-Root Execution**: Runs strictly under `sandbox` user (UID 1000).
+- **CWD Confinement**: CWD must resolve inside `/sandbox`. Traversal attempts and symlink escapes to outside `/sandbox` are rejected with HTTP 400.
+- **Process Group Termination**: Each command runs as a new session leader (`start_new_session=True`). On timeout, the entire process group is terminated (`SIGTERM` -> grace period -> `SIGKILL`).
+- **Bounded Streams**: `stdout` and `stderr` are capped at 1 MiB each with streaming discard to prevent memory exhaustion.
+- **Sanitized Environment**: Executes in a minimal environment (`HOME`, `USER`, `LOGNAME`, `PATH`, `LANG`, `LC_ALL`, `TERM`) without leaking host or Gateway secrets.
+- **Zero Host Execution**: Gateway never executes commands on host or via `docker exec`. Commands execute solely inside the assigned Worker container.
+
+---
+
+### 4. Run the Test Suite
+
+The test suite validates all 7 phases of the minimal sandbox runtime:
 
 ```bash
 # Run all verification phases
@@ -70,7 +113,8 @@ Test coverage:
 - **Phase 3**: Worker Allocation, Virtual Disk Mounting (`/sandbox` ext4) & Non-root Sandbox Permissions
 - **Phase 4**: IPTables Firewall Jail & Network Isolation
 - **Phase 5**: File Operations via Gateway Dual-Mount (Upload, path traversal blocking, 404 on missing)
-- **Phase 6**: Session Release, Container Destruction, Virtual Disk Teardown & Pool Replenishment
+- **Phase 6**: Shell Execution API (Basic exec, stderr capture, non-zero exit code, cwd confinement, symlink escape rejection, filesystem persistence, non-persistent shell state, process tree timeout termination, bounded output streaming, non-root user UID 1000, rootfs write protection, network isolation)
+- **Phase 7**: Session Release, Container Destruction, Virtual Disk Teardown & Worker Recycling (including filesystem destruction verification)
 
 ---
 

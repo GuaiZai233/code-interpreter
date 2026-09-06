@@ -5,6 +5,7 @@ Worker composes VirtualDisk and SandboxFileSystem following the composition
 pattern. VirtualDisk.destroy() is the single source of truth for cleanup.
 """
 import asyncio
+import hashlib
 import os as sync_os
 import time
 import uuid as uuid_mod
@@ -18,14 +19,21 @@ from aiodocker.docker import Docker
 from aiodocker.exceptions import DockerError
 from aiofiles import os as async_os
 from loguru import logger as l
-from pydantic import Field, ValidationError
+from pydantic import Field, PrivateAttr, ValidationError
+from fastapi import HTTPException
 
 from gateway import meta_config
 from gateway.utils.aiohttp_client_session_mixin import AioHttpClientSessionClassVarMixin
+from gateway.utils.http_exceptions import (
+    raise_bad_request,
+    raise_gateway_timeout,
+    raise_service_unavailable,
+)
 
 from .base import ModelBase
 from .exceptions import WorkerPoolShuttingDownError, WorkerProvisionError
 from .field_types import Str128, Str256
+from .shell import ShellExecRequest, ShellExecResponse
 from .files import (
     FileExportItem,
     FileExportResultItem,
@@ -79,6 +87,7 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
     """Virtual disk resource (composition pattern)."""
     user_uuid: UUID | None = None
     last_active_timestamp: float = Field(default_factory=time.time)
+    _destroyed: bool = PrivateAttr(default=False)
 
     model_config = {'arbitrary_types_allowed': True}
 
@@ -116,7 +125,11 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
 
         Delegates disk cleanup to vdisk.destroy() (single source of truth).
         Order: unmount → delete container → detach loop → remove disk file.
+        Idempotent: safe against concurrent or multiple destroy invocations.
         """
+        if self._destroyed:
+            return
+        self._destroyed = True
         l.warning(f"Destroying worker: {self.container_name}")
 
         # 1. Destroy virtual disk (unmount + detach loop + remove file)
@@ -205,6 +218,59 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
         self.touch()
         return await self._get_sandbox_fs().export_files(files)
 
+    async def shell_exec(self, request: ShellExecRequest) -> ShellExecResponse:
+        """
+        Proxies shell execution request to worker container via HTTP.
+
+        Uses an envelope timeout so the worker container has sufficient time
+        to reap its process group before Gateway drops the HTTP connection.
+        """
+        cmd_hash = hashlib.sha256(request.command.encode("utf-8", errors="replace")).hexdigest()[:12]
+        l.debug(
+            f"Executing shell command on worker {self.container_name}: "
+            f"cmd_len={len(request.command)}, cmd_hash={cmd_hash}"
+        )
+        self.touch()
+
+        envelope_timeout = aiohttp.ClientTimeout(total=request.timeout + 5.0)
+        try:
+            async with self.http_session.post(
+                f"{self.internal_url}/api/v1/shell/exec",
+                json=request.model_dump(),
+                timeout=envelope_timeout,
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return ShellExecResponse(**data)
+                elif response.status in (400, 422):
+                    error_detail = await response.text()
+                    try:
+                        error_json = await response.json()
+                        error_detail = error_json.get("detail", error_detail)
+                    except Exception:
+                        pass
+                    if response.status == 400:
+                        raise_bad_request(error_detail)
+                    else:
+                        raise HTTPException(status_code=422, detail=error_detail)
+                else:
+                    text = await response.text()
+                    l.error(f"Worker {self.container_name} shell exec failed: status={response.status}, body={text}")
+                    self.status = WorkerStatus.ERROR
+                    WorkerPool._create_background_task(
+                        WorkerPool.release_worker(self),
+                        f"release_failed_worker_{self.container_name}",
+                    )
+                    raise_service_unavailable(f"Worker returned HTTP {response.status}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            l.error(f"Failed to communicate with worker {self.container_name}: {e}")
+            self.status = WorkerStatus.ERROR
+            WorkerPool._create_background_task(
+                WorkerPool.release_worker(self),
+                f"release_unresponsive_worker_{self.container_name}",
+            )
+            raise_gateway_timeout(f"Worker communication failed: {e}")
+
 
 class WorkerPool:
     """
@@ -226,6 +292,7 @@ class WorkerPool:
     WORKER_MAX_DISK_SIZE_MB: ClassVar[int]
     WORKER_CPU: ClassVar[float]
     WORKER_RAM_MB: ClassVar[int]
+    WORKER_PIDS_LIMIT: ClassVar[int]
     # Internet access configuration
     WORKER_INTERNET_ACCESS: ClassVar[bool]
     INTERNET_NETWORK_NAME: ClassVar[str]
@@ -294,6 +361,7 @@ class WorkerPool:
         cls.WORKER_MAX_DISK_SIZE_MB = meta_config.WORKER_MAX_DISK_SIZE_MB
         cls.WORKER_CPU = meta_config.WORKER_CPU
         cls.WORKER_RAM_MB = meta_config.WORKER_RAM_MB
+        cls.WORKER_PIDS_LIMIT = meta_config.WORKER_PIDS_LIMIT
         # Internet access configuration
         cls.WORKER_INTERNET_ACCESS = meta_config.WORKER_INTERNET_ACCESS
         cls.INTERNET_NETWORK_NAME = meta_config.INTERNET_NETWORK_NAME
@@ -438,6 +506,7 @@ class WorkerPool:
                     'NetworkMode': network_name,
                     'Memory': cls.WORKER_RAM_MB * 1024 * 1024,
                     'NanoCpus': int(cls.WORKER_CPU * 1_000_000_000),
+                    'PidsLimit': cls.WORKER_PIDS_LIMIT,
                     # SECURITY DESIGN: Elevated capabilities required for sandbox functionality:
                     # - SYS_ADMIN: Required for mounting virtual disk inside container
                     # - NET_ADMIN/NET_RAW: Required for network namespace isolation
@@ -563,12 +632,22 @@ class WorkerPool:
 
     @classmethod
     async def release_worker(cls, worker: "Worker") -> None:
-        """Releases a specific worker instance."""
+        """
+        Releases a specific worker instance.
+        Idempotent: if worker is already released or being destroyed, ignores.
+        """
+        removed = False
         async with cls._state_lock:
-            if worker.user_uuid:
-                cls._user_to_worker_map.pop(worker.user_uuid, None)
-            cls._workers.pop(worker.container_id, None)
-            cls._idle_worker_ids.discard(worker.container_id)
+            if worker.container_id in cls._workers:
+                cls._workers.pop(worker.container_id, None)
+                removed = True
+                if worker.user_uuid:
+                    cls._user_to_worker_map.pop(worker.user_uuid, None)
+                cls._idle_worker_ids.discard(worker.container_id)
+
+        if not removed:
+            l.debug(f"Worker {worker.container_name} already removed from pool.")
+            return
 
         l.info(f"Releasing worker {worker.container_name}")
         await cls._destroy_worker(worker)

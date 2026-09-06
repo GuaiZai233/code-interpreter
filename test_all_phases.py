@@ -9,7 +9,8 @@ minimal sandbox runtime:
 - Phase 3: Worker Allocation, Virtual Disk Mounting & Non-Root Sandbox Ownership
 - Phase 4: IPTables Firewall Jail & Network Isolation
 - Phase 5: File Operations via Gateway Dual-Mount Architecture
-- Phase 6: Session Release, Virtual Disk Teardown & Worker Recycling
+- Phase 6: Shell Execution API (Non-Root, Bounded Streams, Timeout Process-Tree Cleanup & Confinement)
+- Phase 7: Session Release, Virtual Disk Teardown & Worker Recycling
 
 Run with: python test_all_phases.py
 """
@@ -28,7 +29,7 @@ import httpx
 # Configuration
 # =============================================================================
 
-GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:3874")
+GATEWAY_URL = os.environ.get("GATEWAY_URL", f"http://127.0.0.1:{os.environ.get('GATEWAY_PORT', '13874')}")
 TIMEOUT = 30.0
 
 
@@ -326,29 +327,485 @@ async def test_phase_5(runner: TestRunner, token: str, test_uuid: str, worker_na
 
 
 # =============================================================================
-# Phase 6: Session Release, Virtual Disk Teardown & Worker Recycling
+# Phase 6: Shell Execution API
 # =============================================================================
 
 async def test_phase_6(runner: TestRunner, token: str, test_uuid: str, worker_name: str):
     print("\n" + "=" * 70)
-    print("PHASE 6: Session Release, Virtual Disk Teardown & Worker Recycling")
+    print("PHASE 6: Shell Execution API")
+    print("=" * 70)
+
+    headers = {"X-Auth-Token": token}
+    params = {"user_uuid": test_uuid}
+
+    async with httpx.AsyncClient(headers=headers) as client:
+        # 6.1: Basic execution (echo hello)
+        resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "echo hello"},
+            timeout=TIMEOUT,
+        )
+        data = resp.json() if resp.status_code == 200 else {}
+        passed_basic = (
+            resp.status_code == 200
+            and data.get("stdout") == "hello\n"
+            and data.get("stderr") == ""
+            and data.get("exit_code") == 0
+            and data.get("timed_out") is False
+            and data.get("stdout_truncated") is False
+            and data.get("stderr_truncated") is False
+            and data.get("duration_ms", -1) >= 0
+        )
+        runner.record("6.1", passed_basic, f"Basic shell execution (stdout={data.get('stdout')!r}, exit_code={data.get('exit_code')})")
+
+        # 6.2: Stderr capture
+        resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "echo err >&2"},
+            timeout=TIMEOUT,
+        )
+        data = resp.json() if resp.status_code == 200 else {}
+        passed_stderr = (
+            resp.status_code == 200
+            and data.get("stdout") == ""
+            and data.get("stderr") == "err\n"
+            and data.get("exit_code") == 0
+        )
+        runner.record("6.2", passed_stderr, f"Stderr captured separately (stderr={data.get('stderr')!r})")
+
+        # 6.3: Non-zero exit code (exit 7)
+        resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "exit 7"},
+            timeout=TIMEOUT,
+        )
+        data = resp.json() if resp.status_code == 200 else {}
+        passed_exit7 = (
+            resp.status_code == 200
+            and data.get("exit_code") == 7
+            and data.get("timed_out") is False
+        )
+        runner.record("6.3", passed_exit7, f"Non-zero exit code returns HTTP 200 with exit_code=7 (got {data.get('exit_code')})")
+
+        # 6.4: Working directory (default /sandbox & custom subdir)
+        resp_def = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "pwd"},
+            timeout=TIMEOUT,
+        )
+        data_def = resp_def.json() if resp_def.status_code == 200 else {}
+
+        await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "mkdir -p /sandbox/subdir"},
+            timeout=TIMEOUT,
+        )
+        resp_sub = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "pwd", "cwd": "/sandbox/subdir"},
+            timeout=TIMEOUT,
+        )
+        data_sub = resp_sub.json() if resp_sub.status_code == 200 else {}
+        passed_cwd = (
+            resp_def.status_code == 200
+            and data_def.get("stdout", "").strip() == "/sandbox"
+            and resp_sub.status_code == 200
+            and data_sub.get("stdout", "").strip() == "/sandbox/subdir"
+        )
+        runner.record("6.4", passed_cwd, "Default cwd is /sandbox and custom cwd /sandbox/subdir works")
+
+        # 6.5: CWD path traversal rejection (/etc, /sandbox/.., /sandbox/../../etc)
+        traversal_paths = ["/etc", "/sandbox/..", "/sandbox/../../etc"]
+        traversal_results = []
+        for bad_cwd in traversal_paths:
+            t_resp = await client.post(
+                f"{GATEWAY_URL}/api/v1/shell/exec",
+                params=params,
+                json={"command": "pwd", "cwd": bad_cwd},
+                timeout=TIMEOUT,
+            )
+            traversal_results.append(t_resp.status_code in (400, 422))
+        passed_traversal = all(traversal_results)
+        runner.record("6.5", passed_traversal, "CWD traversal rejected for /etc, /sandbox/.., etc (all 400/422)")
+
+        # 6.6: Symlink escape rejection
+        await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "ln -sfn /etc /sandbox/escape"},
+            timeout=TIMEOUT,
+        )
+        sym_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "pwd", "cwd": "/sandbox/escape"},
+            timeout=TIMEOUT,
+        )
+        passed_symlink = sym_resp.status_code in (400, 422)
+        runner.record("6.6", passed_symlink, f"Symlink escape rejected by real-path resolution (HTTP {sym_resp.status_code})")
+
+        # 6.7: Filesystem persistence across commands in same session
+        await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "echo 'hello persistence' > /sandbox/state.txt"},
+            timeout=TIMEOUT,
+        )
+        cat_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "cat /sandbox/state.txt"},
+            timeout=TIMEOUT,
+        )
+        cat_data = cat_resp.json() if cat_resp.status_code == 200 else {}
+        passed_fs_persist = (
+            cat_resp.status_code == 200
+            and cat_data.get("stdout", "").strip() == "hello persistence"
+        )
+        runner.record("6.7", passed_fs_persist, "Filesystem persists across shell invocations in same session")
+
+        # 6.8: Shell execution state does not persist (fresh bash process)
+        await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "export TESTVAR=abc123xyz"},
+            timeout=TIMEOUT,
+        )
+        var_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "printf '%s' \"$TESTVAR\""},
+            timeout=TIMEOUT,
+        )
+        var_data = var_resp.json() if var_resp.status_code == 200 else {}
+        passed_fresh_shell = (
+            var_resp.status_code == 200
+            and var_data.get("stdout") == ""
+        )
+        runner.record("6.8", passed_fresh_shell, "Shell environment is isolated per command (variables not persisted)")
+
+        # 6.9: Command timeout & child process reap (sleep 10 with timeout=1)
+        t_start = time.time()
+        to_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "sleep 10", "timeout": 1.0},
+            timeout=TIMEOUT,
+        )
+        t_elapsed = time.time() - t_start
+        to_data = to_resp.json() if to_resp.status_code == 200 else {}
+        await asyncio.sleep(0.5)
+        ps_sleep = run_docker_exec(worker_name, ["pgrep", "-f", "sleep 10"])
+        passed_timeout = (
+            to_resp.status_code == 200
+            and to_data.get("timed_out") is True
+            and to_data.get("exit_code") is None
+            and t_elapsed < 4.0
+            and ps_sleep.returncode != 0
+        )
+        runner.record("6.9", passed_timeout, f"Timeout terminates process and leaves no orphans (timed_out=True, elapsed={t_elapsed:.2f}s)")
+
+        # 6.10: Process tree cleanup (bash -c 'sleep 30 & wait')
+        t_start = time.time()
+        pt_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "bash -c 'sleep 30 & wait'", "timeout": 1.0},
+            timeout=TIMEOUT,
+        )
+        t_elapsed = time.time() - t_start
+        pt_data = pt_resp.json() if pt_resp.status_code == 200 else {}
+        await asyncio.sleep(0.5)
+        ps_tree_sleep = run_docker_exec(worker_name, ["pgrep", "-f", "sleep 30"])
+        passed_tree_cleanup = (
+            pt_resp.status_code == 200
+            and pt_data.get("timed_out") is True
+            and ps_tree_sleep.returncode != 0
+        )
+        runner.record("6.10", passed_tree_cleanup, "Process group cleanup terminates entire process tree on timeout")
+
+        # 6.11: Output truncation & memory safety (5MB output)
+        trunc_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "yes x | head -c 5000000"},
+            timeout=TIMEOUT,
+        )
+        trunc_data = trunc_resp.json() if trunc_resp.status_code == 200 else {}
+        stdout_len = len(trunc_data.get("stdout", "").encode("utf-8"))
+        passed_trunc = (
+            trunc_resp.status_code == 200
+            and trunc_data.get("stdout_truncated") is True
+            and stdout_len <= 1024 * 1024 + 1024
+            and trunc_data.get("exit_code") == 0
+        )
+        runner.record("6.11", passed_trunc, f"Output bounded and truncated without OOM (stdout_bytes={stdout_len}, truncated={trunc_data.get('stdout_truncated')})")
+
+        # 6.12: Non-root sandbox user verification (UID 1000)
+        id_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "id -u && id -un"},
+            timeout=TIMEOUT,
+        )
+        id_data = id_resp.json() if id_resp.status_code == 200 else {}
+        id_lines = id_data.get("stdout", "").strip().splitlines()
+        passed_sandbox_user = (
+            id_resp.status_code == 200
+            and len(id_lines) >= 2
+            and id_lines[0].strip() == "1000"
+            and id_lines[1].strip() == "sandbox"
+        )
+        runner.record("6.12", passed_sandbox_user, "Commands execute strictly under 'sandbox' user (UID 1000)")
+
+        # 6.13: Rootfs write protection (/worker write denied, /sandbox write permitted)
+        rw_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "touch /worker/testfile 2>&1"},
+            timeout=TIMEOUT,
+        )
+        rw_data = rw_resp.json() if rw_resp.status_code == 200 else {}
+
+        sw_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "touch /sandbox/testfile && echo ok"},
+            timeout=TIMEOUT,
+        )
+        sw_data = sw_resp.json() if sw_resp.status_code == 200 else {}
+        passed_rootfs_prot = (
+            rw_data.get("exit_code") != 0
+            and sw_data.get("exit_code") == 0
+            and sw_data.get("stdout", "").strip() == "ok"
+        )
+        runner.record("6.13", passed_rootfs_prot, "Rootfs write protection: /worker write denied, /sandbox write permitted")
+
+        # 6.14: Offline network isolation via firewall jail
+        net_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "curl -s --connect-timeout 2 https://example.com"},
+            timeout=TIMEOUT,
+        )
+        net_data = net_resp.json() if net_resp.status_code == 200 else {}
+        passed_net = (
+            net_resp.status_code == 200
+            and net_data.get("exit_code") != 0
+        )
+        runner.record("6.14", passed_net, f"Outbound network traffic blocked in isolated mode (exit_code={net_data.get('exit_code')})")
+
+        # 6.15: Loopback / internal access to Worker control port 8000 is blocked
+        # Both iptables and verify_gateway_source middleware prevent commands in container
+        # from accessing http://127.0.0.1:8000/api/v1/shell/exec
+        loopback_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "curl -s -m 2 http://127.0.0.1:8000/api/v1/shell/exec || echo BLOCKED"},
+            timeout=TIMEOUT,
+        )
+        loopback_data = loopback_resp.json() if loopback_resp.status_code == 200 else {}
+        passed_loopback = (
+            loopback_resp.status_code == 200
+            and "BLOCKED" in loopback_data.get("stdout", "")
+            and "detail" not in loopback_data.get("stdout", "")
+        )
+        runner.record("6.15", passed_loopback, "Loopback access to worker port 8000 is blocked by iptables / gateway verification")
+
+        # 6.16: Background job (&) containment and orphan reaping
+        # Commands spawning detached background jobs (&) cannot leave surviving processes
+        bg_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "sleep 60 >/dev/null 2>&1 & echo launched"},
+            timeout=TIMEOUT,
+        )
+        bg_data = bg_resp.json() if bg_resp.status_code == 200 else {}
+        await asyncio.sleep(0.5)
+        ps_bg_sleep = run_docker_exec(worker_name, ["pgrep", "-f", "sleep 60"])
+        passed_bg_cleanup = (
+            bg_resp.status_code == 200
+            and bg_data.get("stdout", "").strip() == "launched"
+            and ps_bg_sleep.returncode != 0
+        )
+        runner.record("6.16", passed_bg_cleanup, "Background job (&) terminated upon command completion without lingering orphans")
+
+        # 6.17: Daemonization / setsid() process escape containment
+        # Processes attempting to escape via setsid() are reaped by PR_SET_CHILD_SUBREAPER + proc tracking
+        setsid_cmd = (
+            "python3 - << 'EOF'\n"
+            "import os, time, sys\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    os.setsid()\n"
+            "    with open('/sandbox/daemon.pid', 'w') as f:\n"
+            "        f.write(str(os.getpid()))\n"
+            "    time.sleep(60)\n"
+            "    sys.exit(0)\n"
+            "else:\n"
+            "    for _ in range(50):\n"
+            "        if os.path.exists('/sandbox/daemon.pid'):\n"
+            "            try:\n"
+            "                with open('/sandbox/daemon.pid') as f:\n"
+            "                    dpid = f.read().strip()\n"
+            "                if dpid:\n"
+            "                    print(f'DAEMON_PID:{dpid}', flush=True)\n"
+            "                    sys.exit(0)\n"
+            "            except Exception:\n"
+            "                pass\n"
+            "        time.sleep(0.05)\n"
+            "    print('DAEMON_PID:FAILED', flush=True)\n"
+            "    sys.exit(1)\n"
+            "EOF\n"
+        )
+        daemon_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": setsid_cmd},
+            timeout=TIMEOUT,
+        )
+        daemon_data = daemon_resp.json() if daemon_resp.status_code == 200 else {}
+        daemon_stdout = daemon_data.get("stdout", "")
+        daemon_pid = None
+        for line in daemon_stdout.splitlines():
+            if line.startswith("DAEMON_PID:") and line.split(":", 1)[1].isdigit():
+                daemon_pid = line.split(":", 1)[1].strip()
+                break
+
+        await asyncio.sleep(0.5)
+        daemon_alive = False
+        if daemon_pid:
+            # Check if daemon process is still alive inside container
+            ps_daemon = run_docker_exec(worker_name, ["test", "-e", f"/proc/{daemon_pid}"])
+            daemon_alive = (ps_daemon.returncode == 0)
+        else:
+            ps_daemon = run_docker_exec(worker_name, ["pgrep", "-f", "time.sleep(60)"])
+            daemon_alive = (ps_daemon.returncode == 0)
+
+        passed_daemon = (
+            daemon_resp.status_code == 200
+            and daemon_pid is not None
+            and not daemon_alive
+        )
+        runner.record(
+            "6.17",
+            passed_daemon,
+            f"setsid() daemon escape contained and reaped (spawned_pid={daemon_pid}, alive_after_exec={daemon_alive})",
+        )
+
+        # 6.18: Shell profile persistence isolation (--noprofile --norc)
+        # Attempting to persist arbitrary code via ~/.bash_profile or ~/.bashrc is ignored by fresh shell
+        setup_profile = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "echo 'export PERSISTED_VAR=compromised' > /sandbox/.bash_profile && echo 'export PERSISTED_VAR=compromised' > /sandbox/.bashrc"},
+            timeout=TIMEOUT,
+        )
+        check_profile = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "printf '%s' \"$PERSISTED_VAR\""},
+            timeout=TIMEOUT,
+        )
+        profile_data = check_profile.json() if check_profile.status_code == 200 else {}
+        passed_profile_isolation = (
+            setup_profile.status_code == 200
+            and check_profile.status_code == 200
+            and profile_data.get("stdout") == ""
+        )
+        runner.record("6.18", passed_profile_isolation, "Bash startup files (.bash_profile, .bashrc) ignored via --noprofile --norc")
+
+        # 6.19: Docker cgroup PidsLimit enforcement
+        # Fork bombs or excessive process spawning must be stopped at cgroup limit (default 256)
+        # without destabilizing the host or container, and all children must be cleanly reaped
+        pid_limit_cmd = (
+            "python3 - << 'EOF'\n"
+            "import os, sys, time\n"
+            "pids = []\n"
+            "hit_limit = False\n"
+            "try:\n"
+            "    for i in range(350):\n"
+            "        pid = os.fork()\n"
+            "        if pid == 0:\n"
+            "            time.sleep(10)\n"
+            "            sys.exit(0)\n"
+            "        pids.append(pid)\n"
+            "except (BlockingIOError, OSError):\n"
+            "    hit_limit = True\n"
+            "print(f'FORKED:{len(pids)},HIT_LIMIT:{hit_limit}', flush=True)\n"
+            "EOF\n"
+        )
+        pid_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": pid_limit_cmd},
+            timeout=TIMEOUT,
+        )
+        pid_data = pid_resp.json() if pid_resp.status_code == 200 else {}
+        pid_stdout = pid_data.get("stdout", "")
+        forked_count = 0
+        hit_limit = False
+        for part in pid_stdout.strip().split(","):
+            if part.startswith("FORKED:"):
+                try:
+                    forked_count = int(part.split(":", 1)[1])
+                except ValueError:
+                    pass
+            elif part.startswith("HIT_LIMIT:"):
+                hit_limit = (part.split(":", 1)[1].strip() == "True")
+
+        # Verify worker recovers cleanly and can execute subsequent commands
+        recover_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params=params,
+            json={"command": "echo worker_recovered"},
+            timeout=TIMEOUT,
+        )
+        recover_data = recover_resp.json() if recover_resp.status_code == 200 else {}
+        passed_pid_limit = (
+            pid_resp.status_code == 200
+            and hit_limit is True
+            and 0 < forked_count < 350
+            and recover_resp.status_code == 200
+            and recover_data.get("stdout", "").strip() == "worker_recovered"
+        )
+        runner.record(
+            "6.19",
+            passed_pid_limit,
+            f"PidsLimit enforced (forked={forked_count}, hit_limit={hit_limit}, worker_recovered={recover_data.get('stdout', '').strip() == 'worker_recovered'})",
+        )
+
+
+# =============================================================================
+# Phase 7: Session Release, Virtual Disk Teardown & Worker Recycling
+# =============================================================================
+
+async def test_phase_7(runner: TestRunner, token: str, test_uuid: str, worker_name: str):
+    print("\n" + "=" * 70)
+    print("PHASE 7: Session Release, Virtual Disk Teardown & Worker Recycling")
     print("=" * 70)
 
     headers = {"X-Auth-Token": token}
     async with httpx.AsyncClient(headers=headers) as client:
-        # 6.1: Call release endpoint
+        # 7.1: Call release endpoint
         rel_resp = await client.post(
             f"{GATEWAY_URL}/api/v1/release",
             params={"user_uuid": test_uuid},
             timeout=TIMEOUT,
         )
         passed_rel = rel_resp.status_code == 204
-        runner.record("6.1", passed_rel, f"Session released successfully (HTTP {rel_resp.status_code})")
+        runner.record("7.1", passed_rel, f"Session released successfully (HTTP {rel_resp.status_code})")
 
     # Allow gateway cleanup to complete
     await asyncio.sleep(2.5)
 
-    # 6.2: Verify the released worker container was destroyed
+    # 7.2: Verify the released worker container was destroyed
     inspect_res = subprocess.run(
         ["docker", "ps", "-a", "--filter", f"name={worker_name}", "--format", "{{.Names}}"],
         capture_output=True,
@@ -358,16 +815,39 @@ async def test_phase_6(runner: TestRunner, token: str, test_uuid: str, worker_na
         timeout=10,
     )
     passed_destroyed = worker_name not in inspect_res.stdout.strip().splitlines()
-    runner.record("6.2", passed_destroyed, f"Worker container {worker_name} destroyed on release")
+    runner.record("7.2", passed_destroyed, f"Worker container {worker_name} destroyed on release")
 
-    # 6.3: Verify idle worker pool was replenished
+    # 7.3: Verify idle worker pool was replenished
     async with httpx.AsyncClient(headers=headers) as client:
         status = (await client.get(f"{GATEWAY_URL}/api/v1/status", timeout=TIMEOUT)).json()
         total = status.get("total_workers", 0)
         busy = status.get("busy_workers", 0)
         idle_count = total - busy
         passed_replenished = idle_count >= 1
-        runner.record("6.3", passed_replenished, f"Idle worker pool replenished (idle={idle_count})")
+        runner.record("7.3", passed_replenished, f"Idle worker pool replenished (idle={idle_count})")
+
+    # 7.4: Verify released sandbox filesystem destroyed (previous files absent in fresh session)
+    new_uuid = str(uuid.uuid4())
+    async with httpx.AsyncClient(headers=headers) as client:
+        check_resp = await client.post(
+            f"{GATEWAY_URL}/api/v1/shell/exec",
+            params={"user_uuid": new_uuid},
+            json={"command": "test -e /sandbox/state.txt"},
+            timeout=TIMEOUT,
+        )
+        check_data = check_resp.json() if check_resp.status_code == 200 else {}
+        passed_clean = (
+            check_resp.status_code == 200
+            and check_data.get("exit_code") != 0
+        )
+        runner.record("7.4", passed_clean, "Released sandbox filesystem destroyed (previous session files absent)")
+
+        # Clean up the verification session
+        await client.post(
+            f"{GATEWAY_URL}/api/v1/release",
+            params={"user_uuid": new_uuid},
+            timeout=TIMEOUT,
+        )
 
 
 # =============================================================================
@@ -397,25 +877,24 @@ async def main():
         await test_phase_4(runner, worker_name)
         await test_phase_5(runner, token, test_uuid, worker_name)
         await test_phase_6(runner, token, test_uuid, worker_name)
+        await test_phase_7(runner, token, test_uuid, worker_name)
     else:
-        print("\nSkipping Phases 4-6 due to worker allocation failure.")
+        print("\nSkipping Phases 4-7 due to worker allocation failure.")
 
     # Summary
     print("\n" + "=" * 70)
     print("TEST SUMMARY")
     print("=" * 70)
+    for test_id, passed in runner.results.items():
+        print(f"  Test {test_id}: {'PASS' if passed else 'FAIL'}")
 
-    passed = sum(1 for v in runner.results.values() if v)
     total = len(runner.results)
-
-    for test_id, res in sorted(runner.results.items()):
-        status = "PASS" if res else "FAIL"
-        print(f"  Test {test_id}: {status}")
-
-    print(f"\nTotal: {passed}/{total} tests passed")
+    passed_count = sum(1 for p in runner.results.values() if p)
+    print(f"\nTotal: {passed_count}/{total} tests passed")
     print("=" * 70)
 
-    sys.exit(0 if passed == total else 1)
+    if passed_count != total:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
