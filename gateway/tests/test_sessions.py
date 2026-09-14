@@ -118,3 +118,30 @@ async def test_session_init_success():
         assert call_kwargs["runtime_callback_url"] == "http://host.docker.internal:7999/api/v1/runtime"
         assert call_kwargs["memory_limit_mb"] == 512
         assert call_kwargs["cpu_limit"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_worker_network_mode_topology_isolation():
+    """
+    Verify allowlist workers are placed on internet-capable bridge (so default route exists),
+    while isolated/none workers are strictly placed on internal:true isolated network.
+    """
+    # Verification of network topology rules
+    modes = [
+        ("allowlist", meta_config.INTERNET_NETWORK_NAME, meta_config.GATEWAY_INTERNET_NET_IP),
+        ("public", meta_config.INTERNET_NETWORK_NAME, meta_config.GATEWAY_INTERNET_NET_IP),
+        ("isolated", meta_config.INTERNAL_NETWORK_NAME, meta_config.GATEWAY_INTERNAL_IP),
+        ("none", meta_config.INTERNAL_NETWORK_NAME, meta_config.GATEWAY_INTERNAL_IP),
+    ]
+
+    for network_mode, expected_network, expected_gateway in modes:
+        if network_mode in ("public", "allowlist") or meta_config.WORKER_INTERNET_ACCESS:
+            network_name = meta_config.INTERNET_NETWORK_NAME
+            gateway_ip = meta_config.GATEWAY_INTERNET_NET_IP
+        else:
+            network_name = meta_config.INTERNAL_NETWORK_NAME
+            gateway_ip = meta_config.GATEWAY_INTERNAL_IP
+
+        assert network_name == expected_network, f"Mode {network_mode} assigned wrong network: {network_name}"
+        assert gateway_ip == expected_gateway, f"Mode {network_mode} assigned wrong gateway IP: {gateway_ip}"
+

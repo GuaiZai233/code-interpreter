@@ -63,6 +63,8 @@ if [ -n "$ALLOWED_HOSTS" ]; then
     echo "   -> Configuring firewall whitelist for ALLOWED_HOSTS: $ALLOWED_HOSTS"
     iptables -A OUTPUT -d 127.0.0.11 -p udp --dport 53 -j ACCEPT 2>/dev/null || true
     iptables -A OUTPUT -d 127.0.0.11 -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
 
     OLD_IFS="$IFS"
     IFS=","

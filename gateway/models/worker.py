@@ -527,8 +527,11 @@ class WorkerPool:
             else:
                 image_name = cls.WORKER_IMAGE_NAME
 
-            # Select network based on internet access configuration or network_mode
-            if network_mode == "public" or cls.WORKER_INTERNET_ACCESS:
+            # Select network based on internet access configuration or network_mode.
+            # allowlist mode requires an internet-capable bridge so the container kernel has an L3 default route,
+            # while worker entrypoint.sh iptables rules (default OUTPUT DROP + whitelist) enforce the egress policy.
+            # INTERNAL_NETWORK_NAME (internal: true) is strictly reserved for isolated and none modes.
+            if network_mode in ("public", "allowlist") or cls.WORKER_INTERNET_ACCESS:
                 network_name = cls.INTERNET_NETWORK_NAME
                 gateway_ip = cls.GATEWAY_INTERNET_NET_IP
             else:
@@ -537,7 +540,7 @@ class WorkerPool:
 
             env_list = [
                 f"GATEWAY_INTERNAL_IP={gateway_ip}",
-                f"WORKER_INTERNET_ACCESS={'true' if (network_mode == 'public' or cls.WORKER_INTERNET_ACCESS) else 'false'}",
+                f"WORKER_INTERNET_ACCESS={'true' if (network_mode in ('public', 'allowlist') or cls.WORKER_INTERNET_ACCESS) else 'false'}",
                 f"NETWORK_MODE={network_mode}",
             ]
             if runtime_callback_url:
