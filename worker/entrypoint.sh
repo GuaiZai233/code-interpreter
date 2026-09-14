@@ -61,10 +61,17 @@ fi
 # --- Allowed Hosts Whitelist ---
 if [ -n "$ALLOWED_HOSTS" ]; then
     echo "   -> Configuring firewall whitelist for ALLOWED_HOSTS: $ALLOWED_HOSTS"
+    # Allow Docker DNS (127.0.0.11) and specifically configured nameservers only (prevent ANY:53 exfiltration bypass)
     iptables -A OUTPUT -d 127.0.0.11 -p udp --dport 53 -j ACCEPT 2>/dev/null || true
     iptables -A OUTPUT -d 127.0.0.11 -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
-    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+    if [ -f /etc/resolv.conf ]; then
+        grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | while read -r ns; do
+            if [ -n "$ns" ]; then
+                iptables -A OUTPUT -d "$ns" -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+                iptables -A OUTPUT -d "$ns" -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+            fi
+        done
+    fi
 
     OLD_IFS="$IFS"
     IFS=","

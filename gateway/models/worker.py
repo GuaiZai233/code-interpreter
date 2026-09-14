@@ -91,6 +91,8 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
     allowed_hosts: list[str] = Field(default_factory=list)
     runtime_callback_url: str | None = None
     custom_env: dict[str, str] = Field(default_factory=dict)
+    cpu_limit: float | None = None
+    memory_limit_mb: int | None = None
     last_active_timestamp: float = Field(default_factory=time.time)
     _destroyed: bool = PrivateAttr(default=False)
 
@@ -589,6 +591,8 @@ class WorkerPool:
                 allowed_hosts=allowed_hosts or [],
                 runtime_callback_url=runtime_callback_url,
                 custom_env=custom_env or {},
+                cpu_limit=cpu_limit if (cpu_limit and cpu_limit > 0) else cls.WORKER_CPU,
+                memory_limit_mb=memory_limit_mb if (memory_limit_mb and memory_limit_mb > 0) else cls.WORKER_RAM_MB,
             )
 
             if not await worker.health_check():
@@ -703,6 +707,8 @@ class WorkerPool:
 
         allowed_hosts = allowed_hosts or []
         custom_env = custom_env or {}
+        req_cpu = cpu_limit if (cpu_limit and cpu_limit > 0) else cls.WORKER_CPU
+        req_mem = memory_limit_mb if (memory_limit_mb and memory_limit_mb > 0) else cls.WORKER_RAM_MB
 
         # 1. Check if user already has an active worker
         old_worker_to_destroy = None
@@ -711,11 +717,20 @@ class WorkerPool:
                 worker_id = cls._user_to_worker_map[user_uuid]
                 existing_worker = cls._workers.get(worker_id)
                 if existing_worker:
-                    # If existing worker matches profile, network mode and callback url, reuse it
+                    worker_cpu = existing_worker.cpu_limit if (existing_worker.cpu_limit and existing_worker.cpu_limit > 0) else cls.WORKER_CPU
+                    worker_mem = existing_worker.memory_limit_mb if (existing_worker.memory_limit_mb and existing_worker.memory_limit_mb > 0) else cls.WORKER_RAM_MB
+
+                    # Strictly enforce FULL effective policy matching before permitting worker reuse.
+                    # If allowed_hosts, cpu_limit, memory_limit_mb, custom_env, profile, network_mode, or runtime_callback_url
+                    # differ in any way, fail-recreate to prevent security boundary widening or policy bypass.
                     if (
                         existing_worker.profile == profile
                         and existing_worker.network_mode == network_mode
                         and existing_worker.runtime_callback_url == runtime_callback_url
+                        and sorted(existing_worker.allowed_hosts or []) == sorted(allowed_hosts or [])
+                        and (existing_worker.custom_env or {}) == custom_env
+                        and abs(worker_cpu - req_cpu) < 1e-6
+                        and worker_mem == req_mem
                     ):
                         existing_worker.touch()
                         l.info(f"Reusing existing worker {existing_worker.container_name} for session {user_uuid}")
