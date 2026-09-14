@@ -11,6 +11,7 @@ from .release import router as release_router
 from .files import router as files_router
 from .status import router as status_router
 from .shell import router as shell_router
+from .sessions import router as sessions_router
 
 router = TaggedAPIRouter(prefix="/v1", dependencies=[Depends(verify_token)])
 router.include_router(execute_router)
@@ -18,3 +19,4 @@ router.include_router(release_router)
 router.include_router(files_router)
 router.include_router(status_router)
 router.include_router(shell_router)
+router.include_router(sessions_router)

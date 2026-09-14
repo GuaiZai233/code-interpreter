@@ -86,6 +86,11 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
     vdisk: VirtualDisk
     """Virtual disk resource (composition pattern)."""
     user_uuid: UUID | None = None
+    profile: str = "minimal"
+    network_mode: str = "isolated"
+    allowed_hosts: list[str] = Field(default_factory=list)
+    runtime_callback_url: str | None = None
+    custom_env: dict[str, str] = Field(default_factory=dict)
     last_active_timestamp: float = Field(default_factory=time.time)
     _destroyed: bool = PrivateAttr(default=False)
 
@@ -143,10 +148,23 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
             if e.status != 404:
                 l.error(f"Error deleting container {self.container_name}: {e}")
 
-    def bind_to_user(self, user_uuid: UUID) -> None:
-        """Binds this worker to a user."""
+    def bind_to_user(
+        self,
+        user_uuid: UUID,
+        profile: str = "minimal",
+        network_mode: str = "isolated",
+        allowed_hosts: list[str] | None = None,
+        runtime_callback_url: str | None = None,
+        custom_env: dict[str, str] | None = None,
+    ) -> None:
+        """Binds this worker to a user with profile and policy context."""
         self.status = WorkerStatus.BUSY
         self.user_uuid = user_uuid
+        self.profile = profile
+        self.network_mode = network_mode
+        self.allowed_hosts = allowed_hosts or []
+        self.runtime_callback_url = runtime_callback_url
+        self.custom_env = custom_env or {}
         self.last_active_timestamp = time.time()
 
     def touch(self) -> None:
@@ -283,6 +301,8 @@ class WorkerPool:
     """
     # Configuration (set during init)
     WORKER_IMAGE_NAME: ClassVar[str]
+    WORKER_GO_BUILDER_IMAGE_NAME: ClassVar[str]
+    WORKER_RUNTIME_IMAGE_NAME: ClassVar[str]
     INTERNAL_NETWORK_NAME: ClassVar[str]
     MIN_IDLE_WORKERS: ClassVar[int]
     MAX_TOTAL_WORKERS: ClassVar[int]
@@ -352,6 +372,8 @@ class WorkerPool:
     async def init(cls) -> None:
         """Initializes the WorkerPool from meta_config."""
         cls.WORKER_IMAGE_NAME = meta_config.WORKER_IMAGE_NAME
+        cls.WORKER_GO_BUILDER_IMAGE_NAME = meta_config.WORKER_GO_BUILDER_IMAGE_NAME
+        cls.WORKER_RUNTIME_IMAGE_NAME = meta_config.WORKER_RUNTIME_IMAGE_NAME
         cls.INTERNAL_NETWORK_NAME = meta_config.INTERNAL_NETWORK_NAME
         cls.MIN_IDLE_WORKERS = meta_config.MIN_IDLE_WORKERS
         cls.MAX_TOTAL_WORKERS = meta_config.MAX_TOTAL_WORKERS
@@ -447,7 +469,17 @@ class WorkerPool:
     SEMAPHORE_ACQUIRE_TIMEOUT: ClassVar[float] = 60.0
 
     @classmethod
-    async def _create_worker(cls, retry_count: int = 0) -> Worker:
+    async def _create_worker(
+        cls,
+        retry_count: int = 0,
+        profile: str = "minimal",
+        network_mode: str = "isolated",
+        allowed_hosts: list[str] | None = None,
+        runtime_callback_url: str | None = None,
+        cpu_limit: float | None = None,
+        memory_limit_mb: int | None = None,
+        custom_env: dict[str, str] | None = None,
+    ) -> Worker:
         """
         Creates a new worker container with virtual disk.
 
@@ -484,28 +516,49 @@ class WorkerPool:
             loop_device = await vdisk.attach_loop()
             await vdisk.format()
 
-            l.info(f"Creating worker container: {container_name}")
+            l.info(f"Creating worker container: {container_name} (profile={profile}, net={network_mode})")
             device_mapping = [{"PathOnHost": loop_device, "PathInContainer": "/dev/vdisk", "CgroupPermissions": "rwm"}]
 
-            # Select network based on internet access configuration
-            if cls.WORKER_INTERNET_ACCESS:
+            # Select image based on profile
+            if profile == "go-builder":
+                image_name = cls.WORKER_GO_BUILDER_IMAGE_NAME or cls.WORKER_IMAGE_NAME
+            elif profile == "action-runtime":
+                image_name = cls.WORKER_RUNTIME_IMAGE_NAME or cls.WORKER_IMAGE_NAME
+            else:
+                image_name = cls.WORKER_IMAGE_NAME
+
+            # Select network based on internet access configuration or network_mode
+            if network_mode == "public" or cls.WORKER_INTERNET_ACCESS:
                 network_name = cls.INTERNET_NETWORK_NAME
                 gateway_ip = cls.GATEWAY_INTERNET_NET_IP
             else:
                 network_name = cls.INTERNAL_NETWORK_NAME
                 gateway_ip = cls.GATEWAY_INTERNAL_IP
 
+            env_list = [
+                f"GATEWAY_INTERNAL_IP={gateway_ip}",
+                f"WORKER_INTERNET_ACCESS={'true' if (network_mode == 'public' or cls.WORKER_INTERNET_ACCESS) else 'false'}",
+                f"NETWORK_MODE={network_mode}",
+            ]
+            if runtime_callback_url:
+                env_list.append(f"RUNTIME_CALLBACK_URL={runtime_callback_url}")
+            if allowed_hosts:
+                env_list.append(f"ALLOWED_HOSTS={','.join(allowed_hosts)}")
+            if custom_env:
+                for k, v in custom_env.items():
+                    env_list.append(f"{k}={v}")
+
+            ram_bytes = int((memory_limit_mb if (memory_limit_mb and memory_limit_mb > 0) else cls.WORKER_RAM_MB) * 1024 * 1024)
+            nano_cpus = int((cpu_limit if (cpu_limit and cpu_limit > 0) else cls.WORKER_CPU) * 1_000_000_000)
+
             container_config = {
-                'Image': cls.WORKER_IMAGE_NAME,
-                'Env': [
-                    f"GATEWAY_INTERNAL_IP={gateway_ip}",
-                    f"WORKER_INTERNET_ACCESS={'true' if cls.WORKER_INTERNET_ACCESS else 'false'}",
-                ],
+                'Image': image_name,
+                'Env': env_list,
                 'HostConfig': {
                     'ReadonlyRootfs': True,
                     'NetworkMode': network_name,
-                    'Memory': cls.WORKER_RAM_MB * 1024 * 1024,
-                    'NanoCpus': int(cls.WORKER_CPU * 1_000_000_000),
+                    'Memory': ram_bytes,
+                    'NanoCpus': nano_cpus,
                     'PidsLimit': cls.WORKER_PIDS_LIMIT,
                     # SECURITY DESIGN: Elevated capabilities required for sandbox functionality:
                     # - SYS_ADMIN: Required for mounting virtual disk inside container
@@ -528,6 +581,11 @@ class WorkerPool:
                 internal_url=f"http://{container_name}:8000",
                 status=WorkerStatus.IDLE,
                 vdisk=vdisk,
+                profile=profile,
+                network_mode=network_mode,
+                allowed_hosts=allowed_hosts or [],
+                runtime_callback_url=runtime_callback_url,
+                custom_env=custom_env or {},
             )
 
             if not await worker.health_check():
@@ -563,7 +621,16 @@ class WorkerPool:
             if retry_count < cls.MAX_CREATION_RETRIES:
                 l.warning(f"Retrying worker creation ({retry_count + 1}/{cls.MAX_CREATION_RETRIES})...")
                 await asyncio.sleep(cls.CREATION_RETRY_DELAY)
-                return await cls._create_worker(retry_count + 1)
+                return await cls._create_worker(
+                    retry_count=retry_count + 1,
+                    profile=profile,
+                    network_mode=network_mode,
+                    allowed_hosts=allowed_hosts,
+                    runtime_callback_url=runtime_callback_url,
+                    cpu_limit=cpu_limit,
+                    memory_limit_mb=memory_limit_mb,
+                    custom_env=custom_env,
+                )
             else:
                 raise RuntimeError("Failed to create worker after all retries") from e
 
@@ -612,6 +679,111 @@ class WorkerPool:
             if worker is not None:
                 await cls._destroy_worker(worker)
             raise WorkerProvisionError("Could not provision a new worker environment at this time.") from e
+
+    @classmethod
+    async def create_session_for_user(
+        cls,
+        user_uuid: UUID,
+        profile: str = "minimal",
+        network_mode: str = "isolated",
+        allowed_hosts: list[str] | None = None,
+        runtime_callback_url: str | None = None,
+        cpu_limit: float | None = None,
+        memory_limit_mb: int | None = None,
+        custom_env: dict[str, str] | None = None,
+    ) -> Worker:
+        """
+        Explicitly provisions or re-binds a session with a target profile and network policy.
+        """
+        if cls._shutdown_event and cls._shutdown_event.is_set():
+            raise WorkerPoolShuttingDownError()
+
+        allowed_hosts = allowed_hosts or []
+        custom_env = custom_env or {}
+
+        # 1. Check if user already has an active worker
+        old_worker_to_destroy = None
+        async with cls._state_lock:
+            if user_uuid in cls._user_to_worker_map:
+                worker_id = cls._user_to_worker_map[user_uuid]
+                existing_worker = cls._workers.get(worker_id)
+                if existing_worker:
+                    # If existing worker matches profile, network mode and callback url, reuse it
+                    if (
+                        existing_worker.profile == profile
+                        and existing_worker.network_mode == network_mode
+                        and existing_worker.runtime_callback_url == runtime_callback_url
+                    ):
+                        existing_worker.touch()
+                        l.info(f"Reusing existing worker {existing_worker.container_name} for session {user_uuid}")
+                        return existing_worker
+                    else:
+                        # Policy/profile changed -> must release existing worker to enforce new policy
+                        l.info(f"Session policy changed for user {user_uuid}, releasing previous worker {existing_worker.container_name}")
+                        cls._user_to_worker_map.pop(user_uuid, None)
+                        old_worker_to_destroy = cls._workers.pop(worker_id, None)
+                        cls._idle_worker_ids.discard(worker_id)
+
+        if old_worker_to_destroy:
+            await cls._destroy_worker(old_worker_to_destroy)
+
+        # 2. If requested is default minimal profile with default network and no special callback/limits,
+        # can reuse an idle worker from pool
+        if (
+            profile == "minimal"
+            and network_mode == "isolated"
+            and not allowed_hosts
+            and not runtime_callback_url
+            and not cpu_limit
+            and not memory_limit_mb
+            and not custom_env
+        ):
+            async with cls._state_lock:
+                if cls._idle_worker_ids:
+                    worker_id = cls._idle_worker_ids.pop()
+                    worker = cls._workers[worker_id]
+                    worker.bind_to_user(
+                        user_uuid,
+                        profile=profile,
+                        network_mode=network_mode,
+                        allowed_hosts=allowed_hosts,
+                        runtime_callback_url=runtime_callback_url,
+                        custom_env=custom_env,
+                    )
+                    cls._user_to_worker_map[user_uuid] = worker.container_id
+                    l.info(f"Assigned idle worker {worker.container_name} to user {user_uuid}")
+                    return worker
+
+        # 3. Provision a dedicated worker tailored to the session profile and network policy
+        worker = None
+        try:
+            worker = await cls._create_worker(
+                profile=profile,
+                network_mode=network_mode,
+                allowed_hosts=allowed_hosts,
+                runtime_callback_url=runtime_callback_url,
+                cpu_limit=cpu_limit,
+                memory_limit_mb=memory_limit_mb,
+                custom_env=custom_env,
+            )
+            async with cls._state_lock:
+                cls._workers[worker.container_id] = worker
+                worker.bind_to_user(
+                    user_uuid,
+                    profile=profile,
+                    network_mode=network_mode,
+                    allowed_hosts=allowed_hosts,
+                    runtime_callback_url=runtime_callback_url,
+                    custom_env=custom_env,
+                )
+                cls._user_to_worker_map[user_uuid] = worker.container_id
+            l.info(f"Assigned newly provisioned worker {worker.container_name} (profile={profile}, net={network_mode}) to user {user_uuid}")
+            return worker
+        except Exception as e:
+            l.error(f"Failed to create session worker for user {user_uuid}: {e}")
+            if worker is not None:
+                await cls._destroy_worker(worker)
+            raise WorkerProvisionError("Could not provision a new worker environment for session.") from e
 
     @classmethod
     async def release_worker_by_user(cls, user_uuid: UUID) -> None:

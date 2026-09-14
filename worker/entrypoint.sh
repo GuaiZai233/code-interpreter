@@ -32,8 +32,72 @@ iptables -A INPUT -p tcp -m tcp --dport 8000 -s "$GATEWAY_INTERNAL_IP" -j ACCEPT
 # 核心安全边界：禁止容器内发往端口 8000 的所有出站连接（Worker 为服务端，不需要主动连接 8000）
 iptables -A OUTPUT -p tcp --dport 8000 -j DROP
 
-if [ "$INTERNET_ACCESS" = "true" ]; then
-    echo "   -> Configuring OUTPUT rules for INTERNET-ENABLED mode..."
+# --- Runtime Callback Whitelist (ActionsCat integration) ---
+if [ -n "$RUNTIME_CALLBACK_URL" ]; then
+    echo "   -> Configuring firewall whitelist for RUNTIME_CALLBACK_URL: $RUNTIME_CALLBACK_URL"
+    cb_proto_removed="${RUNTIME_CALLBACK_URL#*://}"
+    cb_host_port="${cb_proto_removed%%/*}"
+    case "$cb_host_port" in
+        *:*)
+            cb_host="${cb_host_port%:*}"
+            cb_port="${cb_host_port##*:}"
+            ;;
+        *)
+            cb_host="$cb_host_port"
+            case "$RUNTIME_CALLBACK_URL" in
+                https://*) cb_port="443" ;;
+                http://*) cb_port="80" ;;
+                *) cb_port="" ;;
+            esac
+            ;;
+    esac
+    if [ -n "$cb_port" ]; then
+        iptables -A OUTPUT -p tcp -d "$cb_host" --dport "$cb_port" -j ACCEPT 2>/dev/null || true
+    else
+        iptables -A OUTPUT -d "$cb_host" -j ACCEPT 2>/dev/null || true
+    fi
+fi
+
+# --- Allowed Hosts Whitelist ---
+if [ -n "$ALLOWED_HOSTS" ]; then
+    echo "   -> Configuring firewall whitelist for ALLOWED_HOSTS: $ALLOWED_HOSTS"
+    iptables -A OUTPUT -d 127.0.0.11 -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+    iptables -A OUTPUT -d 127.0.0.11 -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+
+    OLD_IFS="$IFS"
+    IFS=","
+    for item in $ALLOWED_HOSTS; do
+        item_trimmed=$(echo "$item" | tr -d ' ')
+        if [ -n "$item_trimmed" ]; then
+            case "$item_trimmed" in
+                *:*)
+                    h="${item_trimmed%:*}"
+                    p="${item_trimmed##*:}"
+                    iptables -A OUTPUT -p tcp -d "$h" --dport "$p" -j ACCEPT 2>/dev/null || true
+                    ;;
+                *)
+                    iptables -A OUTPUT -d "$item_trimmed" -j ACCEPT 2>/dev/null || true
+                    ;;
+            esac
+        fi
+    done
+    IFS="$OLD_IFS"
+fi
+
+# Determine effective network mode
+EFFECTIVE_NET_MODE="${NETWORK_MODE:-}"
+if [ -z "$EFFECTIVE_NET_MODE" ]; then
+    if [ "$INTERNET_ACCESS" = "true" ]; then
+        EFFECTIVE_NET_MODE="public"
+    else
+        EFFECTIVE_NET_MODE="isolated"
+    fi
+elif [ "$EFFECTIVE_NET_MODE" = "none" ]; then
+    EFFECTIVE_NET_MODE="isolated"
+fi
+
+if [ "$EFFECTIVE_NET_MODE" = "public" ]; then
+    echo "   -> Configuring OUTPUT rules for PUBLIC mode..."
     iptables -P OUTPUT ACCEPT
     iptables -A OUTPUT -o lo -j ACCEPT
     iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
@@ -42,7 +106,7 @@ if [ "$INTERNET_ACCESS" = "true" ]; then
     iptables -A OUTPUT -d 127.0.0.11 -p udp --dport 53 -j ACCEPT
     iptables -A OUTPUT -d 127.0.0.11 -p tcp --dport 53 -j ACCEPT
 
-    # 禁止所有私有 IP 范围
+    # 禁止所有私有 IP 范围 (已在上方 ACCEPT 的回调或允许主机例外优先匹配)
     iptables -A OUTPUT -d 10.0.0.0/8 -j DROP
     iptables -A OUTPUT -d 172.16.0.0/12 -j DROP
     iptables -A OUTPUT -d 192.168.0.0/16 -j DROP
@@ -56,13 +120,13 @@ if [ "$INTERNET_ACCESS" = "true" ]; then
     # 云元数据服务 IP (AWS/GCP/Azure 等)
     iptables -A OUTPUT -d 169.254.169.254 -j DROP
 
-    echo "   -> Internet access ENABLED (private IPs blocked)."
+    echo "   -> Public internet access ENABLED (private IPs blocked)."
 else
-    echo "   -> Configuring OUTPUT rules for ISOLATED mode..."
+    echo "   -> Configuring OUTPUT rules for $EFFECTIVE_NET_MODE mode..."
     iptables -P OUTPUT DROP
     iptables -A OUTPUT -o lo -j ACCEPT
     iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    echo "   -> Internet access DISABLED (fully isolated)."
+    echo "   -> Mode $EFFECTIVE_NET_MODE enforced (whitelisted destinations permitted)."
 fi
 
 echo "   -> Firewall configured. Gateway IP: $GATEWAY_INTERNAL_IP"
