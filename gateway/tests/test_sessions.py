@@ -121,6 +121,39 @@ async def test_session_init_success():
 
 
 @pytest.mark.asyncio
+async def test_session_init_effective_proxy_callback_priority():
+    """
+    Verify single source of truth invariant:
+    SessionInitResponse.runtime_callback_url MUST return the worker's effective proxy URL
+    (runtime_callback_url) rather than upstream target URL (target_callback_url).
+    """
+    target_uuid = uuid.uuid4()
+    mock_worker = AsyncMock()
+    mock_worker.profile = "action-runtime"
+    mock_worker.network_mode = "isolated"
+    mock_worker.allowed_hosts = []
+    # Upstream ActionsCat core endpoint
+    mock_worker.target_callback_url = "http://host.docker.internal:7999/api/v1/runtime"
+    # Effective gateway proxy endpoint used by worker container
+    mock_worker.runtime_callback_url = f"http://172.28.0.2:3874/api/v1/sessions/{target_uuid}/callback"
+
+    with patch("gateway.models.worker.WorkerPool.create_session_for_user", new=AsyncMock(return_value=mock_worker)):
+        resp = client.post(
+            "/api/v1/sessions",
+            headers={"X-Auth-Token": VALID_TOKEN},
+            json={
+                "user_uuid": str(target_uuid),
+                "profile": "action-runtime",
+                "network": "isolated",
+                "runtime_callback_url": "http://host.docker.internal:7999/api/v1/runtime",
+            },
+        )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["runtime_callback_url"] == f"http://172.28.0.2:3874/api/v1/sessions/{target_uuid}/callback"
+
+
+@pytest.mark.asyncio
 async def test_worker_network_mode_topology_isolation():
     """
     Verify allowlist workers are placed on internet-capable bridge (so default route exists),

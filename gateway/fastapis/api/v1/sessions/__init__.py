@@ -85,7 +85,10 @@ async def init_session(request: SessionInitRequest) -> SessionInitResponse:
 
     target_cb = getattr(worker, "target_callback_url", None)
     runtime_cb = getattr(worker, "runtime_callback_url", None)
-    callback_url = target_cb if isinstance(target_cb, str) else (runtime_cb if isinstance(runtime_cb, str) else None)
+    # The session provisioning effective environment is the single source of truth.
+    # Prioritize runtime_cb (the gateway reverse proxy URL used by worker containers)
+    # over target_cb (the upstream target callback URL).
+    callback_url = runtime_cb if isinstance(runtime_cb, str) else (target_cb if isinstance(target_cb, str) else None)
 
     return SessionInitResponse(
         user_uuid=request.user_uuid,
