@@ -10,7 +10,13 @@ from typing import ClassVar
 import aiohttp
 from loguru import logger as l
 from pydantic import AnyHttpUrl, Field, PrivateAttr, model_validator
-from ssrf_protect.ssrf_protect import SSRFProtect, SSRFProtectException
+try:
+    from ssrf_protect.ssrf_protect import SSRFProtect, SSRFProtectException
+except ImportError:
+    class SSRFProtectException(Exception):
+        pass
+    class SSRFProtect:
+        pass
 
 from gateway import meta_config
 from gateway.utils.aiohttp_client_session_mixin import AioHttpClientSessionClassVarMixin

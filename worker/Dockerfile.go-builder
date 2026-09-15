@@ -1,0 +1,58 @@
+# worker/Dockerfile.go-builder
+#
+# Go builder sandbox runtime worker for ActionsCat.
+
+FROM golang:1.25.3-bookworm AS go-toolchain
+FROM python:3.12.12-slim-bookworm
+
+LABEL maintainer="Foxerine"
+LABEL description="Go builder sandbox worker for ActionsCat compilation."
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/usr/local/go/bin:${PATH}" \
+    GOPATH="/sandbox/go"
+
+# --- System Dependencies ---
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        supervisor \
+        tini \
+        iptables \
+        git \
+        curl \
+        jq \
+        ripgrep \
+        ca-certificates \
+        build-essential \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# --- Copy Go Toolchain ---
+COPY --from=go-toolchain /usr/local/go /usr/local/go
+
+# --- Install Python dependencies using uv and remove build-only binaries ---
+COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /bin/
+
+COPY requirements.txt /tmp/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt /bin/uv /bin/uvx
+
+# --- Sandbox user ---
+RUN useradd --create-home -d /sandbox --shell /bin/bash sandbox && \
+    chown -R sandbox:sandbox /sandbox
+
+# --- Application code ---
+WORKDIR /worker
+ENV PYTHONPATH=/
+
+COPY . /worker
+COPY supervisor/supervisord.conf /etc/supervisor/supervisord.conf
+COPY entrypoint.sh /worker/entrypoint.sh
+RUN chmod +x /worker/entrypoint.sh
+
+WORKDIR /sandbox
+
+EXPOSE 8000
+ENTRYPOINT ["/worker/entrypoint.sh"]

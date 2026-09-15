@@ -39,6 +39,12 @@ class MetaConfig(BaseSettings):
     WORKER_IMAGE_NAME: str = "ghcr.io/foxerine/code-interpreter-worker:latest"
     """Worker Docker 镜像名称"""
 
+    WORKER_GO_BUILDER_IMAGE_NAME: str = "ghcr.io/foxerine/code-interpreter-worker-go-builder:latest"
+    """Go builder worker Docker 镜像名称"""
+
+    WORKER_RUNTIME_IMAGE_NAME: str = "ghcr.io/foxerine/code-interpreter-worker-runtime:latest"
+    """Action runtime worker Docker 镜像名称"""
+
     GATEWAY_INTERNAL_IP: str = "172.28.0.2"
     """Gateway 在内部隔离网络上的 IP"""
 
@@ -132,8 +138,12 @@ class MetaConfig(BaseSettings):
         else:
             token = secrets.token_urlsafe(32)
 
-        token_file.write_text(token)
-        token_file.chmod(0o600)
+        try:
+            token_file.parent.mkdir(parents=True, exist_ok=True)
+            token_file.write_text(token)
+            token_file.chmod(0o600)
+        except OSError:
+            pass
         return token
 
 
@@ -184,6 +194,8 @@ meta_config: MetaConfig = _load_meta_config()
 AUTH_TOKEN: str = meta_config.resolve_auth_token()
 INTERNAL_NETWORK_NAME: str = meta_config.INTERNAL_NETWORK_NAME
 WORKER_IMAGE_NAME: str = meta_config.WORKER_IMAGE_NAME
+WORKER_GO_BUILDER_IMAGE_NAME: str = meta_config.WORKER_GO_BUILDER_IMAGE_NAME
+WORKER_RUNTIME_IMAGE_NAME: str = meta_config.WORKER_RUNTIME_IMAGE_NAME
 GATEWAY_INTERNAL_IP: str = meta_config.GATEWAY_INTERNAL_IP
 WORKER_INTERNET_ACCESS: bool = meta_config.WORKER_INTERNET_ACCESS
 INTERNET_NETWORK_NAME: str = meta_config.INTERNET_NETWORK_NAME
