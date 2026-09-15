@@ -6,7 +6,9 @@ pattern. VirtualDisk.destroy() is the single source of truth for cleanup.
 """
 import asyncio
 import hashlib
+import ipaddress
 import os as sync_os
+import socket
 import time
 import uuid as uuid_mod
 from collections.abc import Coroutine
@@ -90,6 +92,7 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
     network_mode: str = "isolated"
     allowed_hosts: list[str] = Field(default_factory=list)
     runtime_callback_url: str | None = None
+    target_callback_url: str | None = None
     custom_env: dict[str, str] = Field(default_factory=dict)
     cpu_limit: float | None = None
     memory_limit_mb: int | None = None
@@ -157,6 +160,7 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
         network_mode: str = "isolated",
         allowed_hosts: list[str] | None = None,
         runtime_callback_url: str | None = None,
+        target_callback_url: str | None = None,
         custom_env: dict[str, str] | None = None,
     ) -> None:
         """Binds this worker to a user with profile and policy context."""
@@ -166,6 +170,7 @@ class Worker(ModelBase, AioHttpClientSessionClassVarMixin):
         self.network_mode = network_mode
         self.allowed_hosts = allowed_hosts or []
         self.runtime_callback_url = runtime_callback_url
+        self.target_callback_url = target_callback_url or runtime_callback_url
         self.custom_env = custom_env or {}
         self.last_active_timestamp = time.time()
 
@@ -301,24 +306,24 @@ class WorkerPool:
 
     This class uses classmethod pattern and should never be instantiated.
     """
-    # Configuration (set during init)
-    WORKER_IMAGE_NAME: ClassVar[str]
-    WORKER_GO_BUILDER_IMAGE_NAME: ClassVar[str]
-    WORKER_RUNTIME_IMAGE_NAME: ClassVar[str]
-    INTERNAL_NETWORK_NAME: ClassVar[str]
-    MIN_IDLE_WORKERS: ClassVar[int]
-    MAX_TOTAL_WORKERS: ClassVar[int]
-    WORKER_IDLE_TIMEOUT: ClassVar[int]
-    RECYCLING_INTERVAL: ClassVar[int]
-    GATEWAY_INTERNAL_IP: ClassVar[str]
-    WORKER_MAX_DISK_SIZE_MB: ClassVar[int]
-    WORKER_CPU: ClassVar[float]
-    WORKER_RAM_MB: ClassVar[int]
-    WORKER_PIDS_LIMIT: ClassVar[int]
+    # Configuration (defaults from meta_config, refreshed during init)
+    WORKER_IMAGE_NAME: ClassVar[str] = getattr(meta_config, "WORKER_IMAGE_NAME", "code-interpreter-worker")
+    WORKER_GO_BUILDER_IMAGE_NAME: ClassVar[str] = getattr(meta_config, "WORKER_GO_BUILDER_IMAGE_NAME", "code-interpreter-worker-go-builder")
+    WORKER_RUNTIME_IMAGE_NAME: ClassVar[str] = getattr(meta_config, "WORKER_RUNTIME_IMAGE_NAME", "code-interpreter-worker-runtime")
+    INTERNAL_NETWORK_NAME: ClassVar[str] = getattr(meta_config, "INTERNAL_NETWORK_NAME", "code-interpreter-workers-isolated-net")
+    MIN_IDLE_WORKERS: ClassVar[int] = getattr(meta_config, "MIN_IDLE_WORKERS", 1)
+    MAX_TOTAL_WORKERS: ClassVar[int] = getattr(meta_config, "MAX_TOTAL_WORKERS", 10)
+    WORKER_IDLE_TIMEOUT: ClassVar[int] = getattr(meta_config, "WORKER_IDLE_TIMEOUT", 300)
+    RECYCLING_INTERVAL: ClassVar[int] = getattr(meta_config, "RECYCLING_INTERVAL", 60)
+    GATEWAY_INTERNAL_IP: ClassVar[str] = getattr(meta_config, "GATEWAY_INTERNAL_IP", "172.28.0.2")
+    WORKER_MAX_DISK_SIZE_MB: ClassVar[int] = getattr(meta_config, "WORKER_MAX_DISK_SIZE_MB", 1024)
+    WORKER_CPU: ClassVar[float] = getattr(meta_config, "WORKER_CPU", 1.0)
+    WORKER_RAM_MB: ClassVar[int] = getattr(meta_config, "WORKER_RAM_MB", 1024)
+    WORKER_PIDS_LIMIT: ClassVar[int] = getattr(meta_config, "WORKER_PIDS_LIMIT", 100)
     # Internet access configuration
-    WORKER_INTERNET_ACCESS: ClassVar[bool]
-    INTERNET_NETWORK_NAME: ClassVar[str]
-    GATEWAY_INTERNET_NET_IP: ClassVar[str]
+    WORKER_INTERNET_ACCESS: ClassVar[bool] = getattr(meta_config, "WORKER_INTERNET_ACCESS", False)
+    INTERNET_NETWORK_NAME: ClassVar[str] = getattr(meta_config, "INTERNET_NETWORK_NAME", "code-interpreter-workers-net")
+    GATEWAY_INTERNET_NET_IP: ClassVar[str] = getattr(meta_config, "GATEWAY_INTERNET_NET_IP", "172.29.0.2")
 
     # Constants
     MAX_CREATION_RETRIES: ClassVar[int] = 3
@@ -471,13 +476,74 @@ class WorkerPool:
     SEMAPHORE_ACQUIRE_TIMEOUT: ClassVar[float] = 60.0
 
     @classmethod
+    async def _resolve_allowlist_hosts(cls, allowed_hosts: list[str]) -> tuple[list[str], list[str]]:
+        """
+        Resolves hostnames in allowed_hosts to IP addresses.
+        Returns:
+            extra_hosts: list of "hostname:ip" strings for Docker HostConfig.ExtraHosts (/etc/hosts).
+            env_allowed_hosts: list of host/port and ip/port entries for worker ALLOWED_HOSTS env.
+        """
+        extra_hosts: list[str] = []
+        env_allowed_hosts: list[str] = []
+        loop = asyncio.get_running_loop()
+
+        for item in allowed_hosts:
+            item_clean = item.strip()
+            if not item_clean:
+                continue
+
+            if ":" in item_clean:
+                host_part, port_part = item_clean.rsplit(":", 1)
+            else:
+                host_part = item_clean
+                port_part = None
+
+            # Check if host_part is already an IP address
+            is_ip = False
+            try:
+                ipaddress.ip_address(host_part)
+                is_ip = True
+            except ValueError:
+                is_ip = False
+
+            env_allowed_hosts.append(item_clean)
+
+            if is_ip:
+                continue
+
+            # Resolve hostname via getaddrinfo (AF_INET for standard IPv4 docker network)
+            try:
+                addr_infos = await loop.getaddrinfo(host_part, None, family=socket.AF_INET)
+                resolved_ips: set[str] = set()
+                for info in addr_infos:
+                    sockaddr = info[4]
+                    if sockaddr and sockaddr[0]:
+                        resolved_ips.add(sockaddr[0])
+
+                for ip in sorted(resolved_ips):
+                    extra_hosts.append(f"{host_part}:{ip}")
+                    if port_part:
+                        env_allowed_hosts.append(f"{ip}:{port_part}")
+                    else:
+                        env_allowed_hosts.append(ip)
+            except Exception as e:
+                l.warning(f"Could not resolve allowed hostname '{host_part}' for allowlist: {e}")
+
+        # Deduplicate while preserving order
+        unique_extra = list(dict.fromkeys(extra_hosts))
+        unique_env = list(dict.fromkeys(env_allowed_hosts))
+        return unique_extra, unique_env
+
+    @classmethod
     async def _create_worker(
         cls,
         retry_count: int = 0,
+        user_uuid: UUID | None = None,
         profile: str = "minimal",
         network_mode: str = "isolated",
         allowed_hosts: list[str] | None = None,
         runtime_callback_url: str | None = None,
+        target_callback_url: str | None = None,
         cpu_limit: float | None = None,
         memory_limit_mb: int | None = None,
         custom_env: dict[str, str] | None = None,
@@ -540,41 +606,59 @@ class WorkerPool:
                 network_name = cls.INTERNAL_NETWORK_NAME
                 gateway_ip = cls.GATEWAY_INTERNAL_IP
 
+            effective_target_callback = target_callback_url or runtime_callback_url
+            effective_runtime_callback = runtime_callback_url
+            effective_custom_env = dict(custom_env or {})
+
+            if effective_target_callback and user_uuid:
+                proxy_url = f"http://{gateway_ip}:3874/api/v1/sessions/{user_uuid}/callback"
+                effective_runtime_callback = proxy_url
+                effective_custom_env["ACTIONSCAT_RUNTIME_ENDPOINT"] = proxy_url
+
+            extra_hosts: list[str] = []
+            env_allowed_hosts = list(allowed_hosts or [])
+            if network_mode == "allowlist" and allowed_hosts:
+                extra_hosts, env_allowed_hosts = await cls._resolve_allowlist_hosts(allowed_hosts)
+
             env_list = [
                 f"GATEWAY_INTERNAL_IP={gateway_ip}",
                 f"WORKER_INTERNET_ACCESS={'true' if (network_mode in ('public', 'allowlist') or cls.WORKER_INTERNET_ACCESS) else 'false'}",
                 f"NETWORK_MODE={network_mode}",
             ]
-            if runtime_callback_url:
-                env_list.append(f"RUNTIME_CALLBACK_URL={runtime_callback_url}")
-            if allowed_hosts:
-                env_list.append(f"ALLOWED_HOSTS={','.join(allowed_hosts)}")
-            if custom_env:
-                for k, v in custom_env.items():
+            if effective_runtime_callback:
+                env_list.append(f"RUNTIME_CALLBACK_URL={effective_runtime_callback}")
+            if env_allowed_hosts:
+                env_list.append(f"ALLOWED_HOSTS={','.join(env_allowed_hosts)}")
+            if effective_custom_env:
+                for k, v in effective_custom_env.items():
                     env_list.append(f"{k}={v}")
 
             ram_bytes = int((memory_limit_mb if (memory_limit_mb and memory_limit_mb > 0) else cls.WORKER_RAM_MB) * 1024 * 1024)
             nano_cpus = int((cpu_limit if (cpu_limit and cpu_limit > 0) else cls.WORKER_CPU) * 1_000_000_000)
 
+            host_config = {
+                'ReadonlyRootfs': True,
+                'NetworkMode': network_name,
+                'Memory': ram_bytes,
+                'NanoCpus': nano_cpus,
+                'PidsLimit': cls.WORKER_PIDS_LIMIT,
+                # SECURITY DESIGN: Elevated capabilities required for sandbox functionality:
+                # - SYS_ADMIN: Required for mounting virtual disk inside container
+                # - NET_ADMIN/NET_RAW: Required for network namespace isolation
+                # - apparmor:unconfined: Required because custom AppArmor profile not yet implemented
+                # Mitigations: ReadonlyRootfs, isolated network, resource limits, virtual disk quota
+                'CapAdd': ['SYS_ADMIN', 'NET_ADMIN', 'NET_RAW'],
+                'SecurityOpt': ["apparmor:unconfined"],
+                'Devices': device_mapping,
+                'Tmpfs': {'/tmp': 'size=100m,exec', '/run': 'size=50m'},
+            }
+            if extra_hosts:
+                host_config['ExtraHosts'] = extra_hosts
+
             container_config = {
                 'Image': image_name,
                 'Env': env_list,
-                'HostConfig': {
-                    'ReadonlyRootfs': True,
-                    'NetworkMode': network_name,
-                    'Memory': ram_bytes,
-                    'NanoCpus': nano_cpus,
-                    'PidsLimit': cls.WORKER_PIDS_LIMIT,
-                    # SECURITY DESIGN: Elevated capabilities required for sandbox functionality:
-                    # - SYS_ADMIN: Required for mounting virtual disk inside container
-                    # - NET_ADMIN/NET_RAW: Required for network namespace isolation
-                    # - apparmor:unconfined: Required because custom AppArmor profile not yet implemented
-                    # Mitigations: ReadonlyRootfs, isolated network, resource limits, virtual disk quota
-                    'CapAdd': ['SYS_ADMIN', 'NET_ADMIN', 'NET_RAW'],
-                    'SecurityOpt': ["apparmor:unconfined"],
-                    'Devices': device_mapping,
-                    'Tmpfs': {'/tmp': 'size=100m,exec', '/run': 'size=50m'},
-                },
+                'HostConfig': host_config,
                 'Labels': {'managed-by': "code-interpreter-gateway"},
             }
             container = await cls._docker.containers.create_or_replace(config=container_config, name=container_name)
@@ -586,11 +670,13 @@ class WorkerPool:
                 internal_url=f"http://{container_name}:8000",
                 status=WorkerStatus.IDLE,
                 vdisk=vdisk,
+                user_uuid=user_uuid,
                 profile=profile,
                 network_mode=network_mode,
                 allowed_hosts=allowed_hosts or [],
-                runtime_callback_url=runtime_callback_url,
-                custom_env=custom_env or {},
+                runtime_callback_url=effective_runtime_callback,
+                target_callback_url=effective_target_callback,
+                custom_env=effective_custom_env,
                 cpu_limit=cpu_limit if (cpu_limit and cpu_limit > 0) else cls.WORKER_CPU,
                 memory_limit_mb=memory_limit_mb if (memory_limit_mb and memory_limit_mb > 0) else cls.WORKER_RAM_MB,
             )
@@ -630,10 +716,12 @@ class WorkerPool:
                 await asyncio.sleep(cls.CREATION_RETRY_DELAY)
                 return await cls._create_worker(
                     retry_count=retry_count + 1,
+                    user_uuid=user_uuid,
                     profile=profile,
                     network_mode=network_mode,
                     allowed_hosts=allowed_hosts,
                     runtime_callback_url=runtime_callback_url,
+                    target_callback_url=target_callback_url,
                     cpu_limit=cpu_limit,
                     memory_limit_mb=memory_limit_mb,
                     custom_env=custom_env,
@@ -710,6 +798,17 @@ class WorkerPool:
         req_cpu = cpu_limit if (cpu_limit and cpu_limit > 0) else cls.WORKER_CPU
         req_mem = memory_limit_mb if (memory_limit_mb and memory_limit_mb > 0) else cls.WORKER_RAM_MB
 
+        target_callback_url = runtime_callback_url
+        if network_mode in ("public", "allowlist") or cls.WORKER_INTERNET_ACCESS:
+            gateway_ip = cls.GATEWAY_INTERNET_NET_IP
+        else:
+            gateway_ip = cls.GATEWAY_INTERNAL_IP
+
+        expected_proxy_url = f"http://{gateway_ip}:3874/api/v1/sessions/{user_uuid}/callback" if target_callback_url else None
+        expected_custom_env = dict(custom_env or {})
+        if expected_proxy_url:
+            expected_custom_env["ACTIONSCAT_RUNTIME_ENDPOINT"] = expected_proxy_url
+
         # 1. Check if user already has an active worker
         old_worker_to_destroy = None
         async with cls._state_lock:
@@ -723,12 +822,21 @@ class WorkerPool:
                     # Strictly enforce FULL effective policy matching before permitting worker reuse.
                     # If allowed_hosts, cpu_limit, memory_limit_mb, custom_env, profile, network_mode, or runtime_callback_url
                     # differ in any way, fail-recreate to prevent security boundary widening or policy bypass.
+                    callback_matched = (
+                        existing_worker.target_callback_url == target_callback_url
+                        or existing_worker.runtime_callback_url == runtime_callback_url
+                        or (expected_proxy_url is not None and existing_worker.runtime_callback_url == expected_proxy_url)
+                    )
+                    env_matched = (
+                        (existing_worker.custom_env or {}) == expected_custom_env
+                        or (existing_worker.custom_env or {}) == (custom_env or {})
+                    )
                     if (
                         existing_worker.profile == profile
                         and existing_worker.network_mode == network_mode
-                        and existing_worker.runtime_callback_url == runtime_callback_url
+                        and callback_matched
                         and sorted(existing_worker.allowed_hosts or []) == sorted(allowed_hosts or [])
-                        and (existing_worker.custom_env or {}) == custom_env
+                        and env_matched
                         and abs(worker_cpu - req_cpu) < 1e-6
                         and worker_mem == req_mem
                     ):
@@ -766,6 +874,7 @@ class WorkerPool:
                         network_mode=network_mode,
                         allowed_hosts=allowed_hosts,
                         runtime_callback_url=runtime_callback_url,
+                        target_callback_url=target_callback_url,
                         custom_env=custom_env,
                     )
                     cls._user_to_worker_map[user_uuid] = worker.container_id
@@ -776,10 +885,12 @@ class WorkerPool:
         worker = None
         try:
             worker = await cls._create_worker(
+                user_uuid=user_uuid,
                 profile=profile,
                 network_mode=network_mode,
                 allowed_hosts=allowed_hosts,
                 runtime_callback_url=runtime_callback_url,
+                target_callback_url=target_callback_url,
                 cpu_limit=cpu_limit,
                 memory_limit_mb=memory_limit_mb,
                 custom_env=custom_env,
@@ -791,8 +902,9 @@ class WorkerPool:
                     profile=profile,
                     network_mode=network_mode,
                     allowed_hosts=allowed_hosts,
-                    runtime_callback_url=runtime_callback_url,
-                    custom_env=custom_env,
+                    runtime_callback_url=worker.runtime_callback_url,
+                    target_callback_url=worker.target_callback_url,
+                    custom_env=worker.custom_env,
                 )
                 cls._user_to_worker_map[user_uuid] = worker.container_id
             l.info(f"Assigned newly provisioned worker {worker.container_name} (profile={profile}, net={network_mode}) to user {user_uuid}")
@@ -885,6 +997,14 @@ class WorkerPool:
         container_id = cls._user_to_worker_map.get(user_uuid)
         if container_id:
             return cls._workers.get(container_id)
+        return None
+
+    @classmethod
+    def get_active_worker_by_user(cls, user_uuid: UUID) -> Worker | None:
+        """Gets active worker bound to user_uuid, if present and not destroyed."""
+        worker = cls.get_worker_by_user(user_uuid)
+        if worker and not worker._destroyed and worker.status != WorkerStatus.ERROR:
+            return worker
         return None
 
     @classmethod

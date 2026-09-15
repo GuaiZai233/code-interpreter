@@ -240,3 +240,124 @@ async def test_worker_full_policy_reconfiguration():
         assert reused.container_id == "worker-2"
 
 
+@pytest.mark.asyncio
+async def test_session_callback_proxy_success():
+    """
+    Verify callback reverse proxy forwards requests to upstream callback URL
+    without requiring Gateway's admin X-Auth-Token, carrying Authorization bearer token,
+    forwarding body, and returning upstream response.
+    """
+    from unittest.mock import MagicMock
+    from gateway.models.virtual_disk import VirtualDisk
+    from gateway.models.worker import Worker, WorkerPool
+    from gateway.utils.aiohttp_client_session_mixin import AioHttpClientSessionClassVarMixin
+
+    user_id = uuid.uuid4()
+    mock_vdisk = MagicMock(spec=VirtualDisk)
+    worker = Worker(
+        container_id="worker-proxy-test",
+        container_name="code-worker-proxy",
+        internal_url="http://code-worker-proxy:8000",
+        vdisk=mock_vdisk,
+        profile="action-runtime",
+        network_mode="isolated",
+        target_callback_url="http://upstream-actions-cat:7999/api/v1/runtime",
+        runtime_callback_url=f"http://172.28.0.2:3874/api/v1/sessions/{user_id}/callback",
+        user_uuid=user_id,
+    )
+
+    # Mock aiohttp response
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.content_type = "application/json"
+    mock_resp.headers = {"Content-Type": "application/json", "X-Custom-Header": "core-resp"}
+    mock_resp.read = AsyncMock(return_value=b'{"success": true, "written": 42}')
+
+    # Mock context manager for http_session.request
+    mock_cm = AsyncMock()
+    mock_cm.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_cm.__aexit__ = AsyncMock(return_value=None)
+
+    mock_http_session = MagicMock()
+    mock_http_session.request = MagicMock(return_value=mock_cm)
+
+    with patch.object(WorkerPool, "get_active_worker_by_user", return_value=worker), \
+         patch.object(AioHttpClientSessionClassVarMixin, "get_http_session", return_value=mock_http_session):
+
+        # Note: No X-Auth-Token header passed! This tests that container callback bypasses gateway admin auth.
+        resp = client.post(
+            f"/api/v1/sessions/{user_id}/callback/state",
+            headers={"Authorization": "Bearer sample-run-token", "Content-Type": "application/json"},
+            content=b'{"state_key": "val"}',
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {"success": True, "written": 42}
+        assert resp.headers.get("x-custom-header") == "core-resp"
+
+        mock_http_session.request.assert_called_once()
+        call_kwargs = mock_http_session.request.call_args.kwargs
+        assert call_kwargs["method"] == "POST"
+        assert call_kwargs["url"] == "http://upstream-actions-cat:7999/api/v1/runtime/state"
+        assert call_kwargs["data"] == b'{"state_key": "val"}'
+        assert call_kwargs["headers"]["authorization"] == "Bearer sample-run-token"
+
+
+@pytest.mark.asyncio
+async def test_session_callback_proxy_not_found():
+    """Verify 404 is returned when no active worker exists for user."""
+    from gateway.models.worker import WorkerPool
+
+    random_id = uuid.uuid4()
+    with patch.object(WorkerPool, "get_active_worker_by_user", return_value=None):
+        resp = client.post(f"/api/v1/sessions/{random_id}/callback/state")
+        assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_session_callback_proxy_no_callback_url():
+    """Verify 400 is returned when worker has no target_callback_url configured."""
+    from unittest.mock import MagicMock
+    from gateway.models.virtual_disk import VirtualDisk
+    from gateway.models.worker import Worker, WorkerPool
+
+    user_id = uuid.uuid4()
+    mock_vdisk = MagicMock(spec=VirtualDisk)
+    worker = Worker(
+        container_id="worker-no-url",
+        container_name="code-worker-no-url",
+        internal_url="http://code-worker-no-url:8000",
+        vdisk=mock_vdisk,
+        profile="action-runtime",
+        network_mode="isolated",
+        target_callback_url=None,
+        runtime_callback_url=None,
+        user_uuid=user_id,
+    )
+
+    with patch.object(WorkerPool, "get_active_worker_by_user", return_value=worker):
+        resp = client.post(f"/api/v1/sessions/{user_id}/callback/state")
+        assert resp.status_code == 400
+        assert "No runtime callback URL configured" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_resolve_allowlist_hosts():
+    """Verify hostname DNS resolution and ExtraHosts formatting in allowlist mode."""
+    from gateway.models.worker import WorkerPool
+
+    hosts = ["127.0.0.1:8080", "10.0.0.1", "localhost:443"]
+    extra_hosts, env_hosts = await WorkerPool._resolve_allowlist_hosts(hosts)
+
+    # IPs should be preserved in env_hosts and NOT added to extra_hosts
+    assert "127.0.0.1:8080" in env_hosts
+    assert "10.0.0.1" in env_hosts
+
+    # localhost should resolve to 127.0.0.1 and be formatted as "localhost:127.0.0.1" in extra_hosts
+    assert any(eh.startswith("localhost:") for eh in extra_hosts)
+    # env_hosts should contain both the original and resolved ip:port
+    assert "localhost:443" in env_hosts
+    assert any(":443" in eh for eh in env_hosts if not eh.startswith("localhost"))
+
+
+

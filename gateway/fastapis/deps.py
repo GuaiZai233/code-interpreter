@@ -5,7 +5,7 @@ import secrets
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Request
 
 from gateway import meta_config
 from gateway.models.exceptions import WorkerPoolShuttingDownError, WorkerProvisionError
@@ -13,9 +13,15 @@ from gateway.models.worker import Worker, WorkerPool
 from gateway.utils.http_exceptions import raise_not_found, raise_service_unavailable, raise_unauthorized
 
 
-async def verify_token(x_auth_token: str | None = Header(default=None)) -> None:
-    if not x_auth_token or not secrets.compare_digest(x_auth_token, meta_config.AUTH_TOKEN):
-        raise_unauthorized("Invalid or missing authentication token")
+async def verify_token(request: Request, x_auth_token: str | None = Header(default=None)) -> None:
+    if x_auth_token and secrets.compare_digest(x_auth_token, meta_config.AUTH_TOKEN):
+        return
+    # Bypass Gateway admin token for session callback proxy endpoints:
+    # Worker sandbox containers authenticate against upstream ActionsCat Core using capability tokens
+    path = request.url.path
+    if "/sessions/" in path and ("/callback" in path or path.endswith("/callback")):
+        return
+    raise_unauthorized("Invalid or missing authentication token")
 
 
 async def get_worker(user_uuid: UUID) -> Worker:
