@@ -50,9 +50,13 @@ services:
       - WORKER_RAM_MB=${WORKER_RAM_MB:-1536}
       - WORKER_MAX_DISK_SIZE_MB=${WORKER_MAX_DISK_SIZE_MB:-500}
       - WORKER_IMAGE_NAME=ghcr.io/foxerine/code-interpreter-worker:${IMAGE_TAG:-latest}
+      - WORKER_GO_BUILDER_IMAGE_NAME=ghcr.io/foxerine/code-interpreter-worker-go-builder:${IMAGE_TAG:-latest}
+      - WORKER_RUNTIME_IMAGE_NAME=ghcr.io/foxerine/code-interpreter-worker-runtime:${IMAGE_TAG:-latest}
       - SSRF_PROTECTION_ENABLED=${SSRF_PROTECTION_ENABLED:-true}
     depends_on:
       - worker # 确保 worker 镜像存在
+      - worker-go-builder
+      - worker-action-runtime
 
   worker:
     build:
@@ -64,6 +68,28 @@ services:
     restart: "no" # 确保 Docker 重启后不会自动启动此临时容器
     networks:
       # [更新] 只连接到内部隔离网络。这个 builder 容器本身不应需要互联网
+      - code-interpreter-workers-isolated-net
+
+  worker-go-builder:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile.go-builder
+    image: ghcr.io/foxerine/code-interpreter-worker-go-builder:${IMAGE_TAG:-latest}
+    container_name: code-interpreter_worker_go_builder
+    entrypoint: /bin/true
+    restart: "no"
+    networks:
+      - code-interpreter-workers-isolated-net
+
+  worker-action-runtime:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile.action-runtime
+    image: ghcr.io/foxerine/code-interpreter-worker-runtime:${IMAGE_TAG:-latest}
+    container_name: code-interpreter_worker_action_runtime
+    entrypoint: /bin/true
+    restart: "no"
+    networks:
       - code-interpreter-workers-isolated-net
 
 networks:

@@ -287,6 +287,17 @@ class ShellExecutor:
 
             # Launch /bin/bash --noprofile --norc -c with clean minimal environment and new session
             # --noprofile --norc ensures user-writable /sandbox/.bash_profile or .bashrc are NEVER loaded
+            # Build execution environment: retain clean base but inherit container PATH,
+            # toolchain settings, and provisioned ActionsCat runtime configurations.
+            exec_env = dict(self.CLEAN_ENV)
+            if "PATH" in os.environ:
+                exec_env["PATH"] = os.environ["PATH"]
+            elif "/usr/local/go/bin" not in exec_env["PATH"]:
+                exec_env["PATH"] = f"/usr/local/go/bin:{exec_env['PATH']}"
+            for k, v in os.environ.items():
+                if k.startswith("ACTIONSCAT_") or k in ("GOPATH", "GOROOT", "PYTHONPATH", "CGO_ENABLED", "HOME", "USER"):
+                    exec_env[k] = v
+
             process = await asyncio.create_subprocess_exec(
                 "/bin/bash",
                 "--noprofile",
@@ -294,7 +305,7 @@ class ShellExecutor:
                 "-c",
                 request.command,
                 cwd=str(resolved_cwd),
-                env=self.CLEAN_ENV,
+                env=exec_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
